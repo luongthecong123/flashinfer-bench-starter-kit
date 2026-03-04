@@ -32,8 +32,10 @@ image = (
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
+def run_benchmark(solution: Solution, config: BenchmarkConfig = None, max_workloads: int = 0) -> dict:
     """Run benchmark on Modal B200 and return results."""
+    import sys
+    
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
@@ -48,6 +50,13 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
 
+    print(f"Found {len(workloads)} workloads for {solution.definition}", flush=True)
+
+    # Limit number of workloads for quick testing
+    if max_workloads > 0:
+        workloads = workloads[:max_workloads]
+        print(f"Limiting to {len(workloads)} workload(s)", flush=True)
+
     bench_trace_set = TraceSet(
         root=trace_set.root,
         definitions={definition.name: definition},
@@ -56,13 +65,14 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
         traces={definition.name: []},
     )
 
+    print("Starting benchmark...", flush=True)
     benchmark = Benchmark(bench_trace_set, config)
     result_trace_set = benchmark.run_all(dump_traces=True)
 
     traces = result_trace_set.traces.get(definition.name, [])
     results = {definition.name: {}}
 
-    for trace in traces:
+    for i, trace in enumerate(traces):
         if trace.evaluation:
             entry = {
                 "status": trace.evaluation.status.value,
@@ -76,7 +86,17 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
                 entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
                 entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
             results[definition.name][trace.workload.uuid] = entry
+            
+            # Print progress for each workload
+            status = entry["status"]
+            msg = f"  [{i+1}/{len(traces)}] Workload {trace.workload.uuid[:8]}...: {status}"
+            if entry.get("latency_ms") is not None:
+                msg += f" | {entry['latency_ms']:.3f} ms"
+            if entry.get("speedup_factor") is not None:
+                msg += f" | {entry['speedup_factor']:.2f}x speedup"
+            print(msg, flush=True)
 
+    print(f"\nDone! {len(results[definition.name])} workloads processed.", flush=True)
     return results
 
 
@@ -114,8 +134,11 @@ def main():
     solution = Solution.model_validate_json(solution_path.read_text())
     print(f"Loaded: {solution.name} ({solution.definition})")
 
-    print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution)
+    import os
+    max_workloads = int(os.environ.get("MAX_WORKLOADS", 0))
+
+    print(f"\nRunning benchmark on Modal B200... (max_workloads={max_workloads or 'all'})")
+    results = run_benchmark.remote(solution, max_workloads=max_workloads)
 
     if not results:
         print("No results returned!")
