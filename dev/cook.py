@@ -7,7 +7,7 @@ from safetensors.torch import load_file
 # ── Flags ──
 CHECK   = True
 MEASURE = True
-TOY_CHECK = True   # quick small-scale sanity check first
+# TOY_CHECK = True   # quick small-scale sanity check first
 TOY_CHECK = False
 
 # ── Model params ──
