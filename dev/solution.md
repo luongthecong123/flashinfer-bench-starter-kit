@@ -175,3 +175,61 @@ No batching benefit                     cuBLAS batched GEMM (T matrices at once)
 **Waste from padding:** 56% of rows have V < 50 (median = 33), so we compute ~60× more than needed for those. But the single fused kernel launch + batched GEMM efficiency far outweighs this waste.
 
 **Result:** ~7–10× speedup over reference on B200 (steady state).
+
+---
+
+## Latency Profiling (NVIDIA B200)
+
+Profiled with CUDA events per stage, averaged over 23 workloads (steady-state, excluding torch.compile warmup):
+
+### Breakdown (T=2 tokens, representative)
+
+| Stage | Avg (ms) | % of Total | Description |
+|-------|----------|------------|-------------|
+| **attention** | 0.17 | **63–66%** | `@torch.compile`-d batched attention (4× bf16→f32 casts, 2× BMM scores, mask+scale, logsumexp, softmax, 1× BMM output, cast back) |
+| **mask_idx** | 0.036 | ~13% | `sparse_indices == -1` comparison + `clamp(min=0).long()` |
+| **gather** | 0.033 | ~12% | Advanced indexing gather of KV cache entries from flat pool |
+| **copy_out** | 0.013 | ~5% | `output.copy_(out)` + `lse.copy_(token_lse)` |
+| **flatten** | 0.011 | ~4% | `ckv_cache.reshape(-1, D)` (just a view, near-free) |
+| **TOTAL** | ~0.28 | 100% | |
+
+### Scaling with T (batch size)
+
+| T | Total (ms) | Attention (ms) | Notes |
+|---|-----------|----------------|-------|
+| 1 | 0.25 | 0.17 | Minimal batch |
+| 2 | 0.28 | 0.17 | Most workloads |
+| 6 | 0.28 | 0.19 | Slight attention increase |
+| 7 | 0.31 | 0.21 | |
+| 8 | 0.31 | 0.21 | Largest batch |
+
+### Bottleneck Analysis
+
+1. **Primary bottleneck: `attention` (~65%)** — The fused `@torch.compile` block doing score computation (2× BMM), softmax, and output matmul (1× BMM). The bf16→f32 casts, materializing the full [T, 16, 2048] attention matrix, and 3 separate BMM calls are the main costs.
+
+2. **Secondary bottleneck: `mask_idx` + `gather` (~25%)** — Index preparation and scattered memory reads from the 529 MiB KV cache pool. The gather reads ~2 MB per token from scattered locations.
+
+3. **Negligible: `flatten` + `copy_out` (~9%)** — Reshapes (views) and final copies are near-free.
+
+### Optimization Targets
+
+- **Attention**: A fused FlashAttention-style kernel (CUDA or Triton) that avoids materializing the full [T, 16, 2048] score matrix and eliminates the f32 cast overhead would cut this stage significantly. Online softmax with tiling would reduce memory bandwidth.
+- **Gather + Mask**: Could be fused into a single custom kernel that reads sparse_indices, clamps, gathers, and masks in one pass instead of multiple PyTorch ops.
+
+### Optimization Difficulty Ranking (easiest → hardest)
+
+| Rank | Stage | Time (ms) | % | Difficulty | Rationale |
+|------|-------|-----------|---|------------|-----------|
+| 1 | **flatten** | 0.011 | 4% | Already optimal | `.reshape()` view — zero-copy, zero-compute. Nothing to optimize. |
+| 2 | **copy_out** | 0.013 | 5% | Easy | Eliminate by writing directly into pre-allocated `output`/`lse` buffers instead of creating temporaries. |
+| 3 | **mask_idx** | 0.036 | 13% | Easy–Moderate | Two elementwise ops (`== -1`, `clamp + cast`). Fuse into the gather kernel to handle -1 indices on-the-fly, eliminating this stage entirely. |
+| 4 | **gather** | 0.033 | 12% | Moderate | Memory-bandwidth bound (~2 MB/token from scattered 529 MiB pool). Custom CUDA kernel can fuse mask+gather+bf16→f32 cast, but can't beat the memory bandwidth wall. Gains from fusion (eliminating intermediate buffers). |
+| 5 | **attention** | 0.17–0.21 | 65% | Hard | Requires fused FlashAttention-style tiled kernel: online softmax (avoid materializing [T,16,2048] matrix), split nope+PE score accumulation, lse in log2 space, bf16 I/O with f32 accumulation, custom padding mask. Highest effort but biggest payoff. |
+
+### Recommended Attack Order (bang-for-buck)
+
+1. **copy_out** — trivial fix, saves ~0.013 ms
+2. **mask_idx + gather fusion** — moderate effort, saves ~0.07 ms combined by eliminating intermediate tensors and kernel launches
+3. **attention** — high effort but 65% of wall time. A fused kernel could cut attention by 2–5×, saving 0.08–0.15 ms
+
+**Realistic optimization ceiling:** from ~0.28 ms down to ~0.10–0.15 ms with fused attention kernel and gather fusion.

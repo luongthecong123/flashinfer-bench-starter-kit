@@ -173,6 +173,64 @@ KV cache/token:          KV cache/token:             KV cache/token:
 Attend to: all seq_len   Attend to: all seq_len        2048 (not all)
 ```
 
+#### MHA vs MLA — Code with Shapes
+
+Both shown for all 16 heads, per decode token:
+
+**MHA (16 heads, each with its own K and V):**
+```python
+# Each head has its OWN K and V — no sharing
+# K: [16, seq, 128]  — separate per head
+# V: [16, seq, 128]  — separate per head
+
+# Score (batched over heads)
+logits = q @ K.T                        # [16, 128] @ [16, 128, seq] → [16, seq]
+logits = logits / sqrt(128)             # [16, seq]
+
+# Softmax — attends to ALL seq tokens
+attn = softmax(logits, dim=-1)          # [16, seq]
+
+# Output
+out = attn @ V                          # [16, seq] @ [16, seq, 128] → [16, 128]
+```
+
+**MLA/DSA (16 heads, sharing one Kc and Kp, sparse 2048 tokens):**
+```python
+# All heads share the SAME Kc and Kp — no per-head copies
+# Kc: [2048, 512]  — shared (is both K and V), only 2048 sparse-selected tokens
+# Kp: [2048, 64]   — shared (positional), same 2048 tokens
+
+# Score (broadcast — one Kc serves all 16 heads)
+logits = (qn @ Kc.T)                    # [16, 512] @ [512, 2048] → [16, 2048]
+       + (qp @ Kp.T)                    # [16, 64]  @ [64, 2048]  → [16, 2048]
+logits = logits * sm_scale              # [16, 2048]
+
+# Softmax — attends to only 2048 sparse-selected tokens
+attn = softmax(logits, dim=-1)          # [16, 2048]
+
+# Output — Kc is BOTH K and V, still broadcast
+out = attn @ Kc                         # [16, 2048] @ [2048, 512] → [16, 512]
+```
+
+**KV cache per token — the real difference:**
+```
+MHA:  K[16, 128] + V[16, 128] = 4096 values (8 KB bf16)  — per-head, separate K and V
+MLA:  Kc[512]    + Kp[64]     =  576 values (1.15 KB bf16) — shared, K=V fused
+                                                             57x smaller
+```
+
+**Compute per token (using seq=2048 for MHA to compare FLOP at same token count):**
+```
+          MHA (seq=2048)                   MLA (2048 sparse tokens)
+Score:    16 × 2×128×2048 = 8.4M          16 × 2×512×2048 = 33.6M  (nope)
+                                         + 16 × 2×64×2048  =  4.2M  (PE)
+Output:   16 × 2×2048×128 = 8.4M          16 × 2×2048×512 = 33.6M
+Total:    16.8M FLOP                       71.4M FLOP  (4.3x more compute)
+```
+
+MLA pays ~4x more FLOP per token but saves 57x on KV cache memory.
+MHA must attend to ALL seq tokens; DSA selects only 2048 — at 100K context that's ~50x fewer tokens.
+
 
 ---
 
@@ -558,6 +616,16 @@ Where:
 |--------|-------|-------|-------------|
 | `output` | `[T, 16, 512]` | bf16 | Attention output per token per head |
 | `lse` | `[T, 16]` | f32 | Log-sum-exp (base 2) of attention logits |
+
+**Why is LSE needed?**
+
+DSA only attends to 2048 sparse-selected tokens, but other layers in the model (e.g., sliding window attention, compressed attention) attend to *different* subsets. Their partial attention results must be **merged** into one final output. The standard FlashAttention online-softmax merge formula is:
+
+$$o_{merged} = \frac{e^{lse_1} \cdot o_1 + e^{lse_2} \cdot o_2}{e^{lse_1} + e^{lse_2}}$$
+
+Each branch produces its own `output` and `lse`. The LSE acts as the "confidence weight" — it tells the merger how much total attention mass each branch saw. Without it, you'd need to re-run softmax over the *union* of all branches' logits, which defeats the purpose of splitting the work.
+
+The base-2 convention ($lse = \text{logsumexp}(\text{logits}) / \ln 2$) matches FlashAttention's internal format, allowing direct use in the merge without conversion.
 
 <a id="53-sm_scale-note"></a>
 

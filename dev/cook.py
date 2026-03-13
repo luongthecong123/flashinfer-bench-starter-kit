@@ -28,6 +28,8 @@ JSONL   = CONTEST / "workloads" / "dsa_paged" / "dsa_sparse_attention_h16_ckv512
 # ── Imports ──
 from ref import run as ref_fn
 from impl import run as impl_fn
+# from impl_cutedsl import run as impl_fn
+# from impl_tr import run as impl_fn
 
 # ────────────────────────────────────────────
 def make_tensors(T, P, valid_per_token=None, device="cuda"):
