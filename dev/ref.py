@@ -5,7 +5,7 @@ import torch
 
 
 @torch.no_grad()
-def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, lse):
+def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, lse, is_profiling=False):
     num_tokens, num_qo_heads, head_dim_ckv = q_nope.shape
     head_dim_kpe = q_pe.shape[-1]
     num_pages, page_size, _ = ckv_cache.shape
@@ -26,12 +26,15 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, ls
     device = q_nope.device
 
     # Flatten paged KV cache to token-level: [num_pages, page_size, dim] -> [num_pages * page_size, dim]
+    if is_profiling: torch.cuda.nvtx.range_push('flatten_kv_cache')
     Kc_all = ckv_cache.reshape(-1, head_dim_ckv).to(torch.float32)  # [total_kv_tokens, head_dim_ckv]
     Kp_all = kpe_cache.reshape(-1, head_dim_kpe).to(torch.float32)  # [total_kv_tokens, head_dim_kpe]
+    if is_profiling: torch.cuda.nvtx.range_pop()
 
     output.zero_()
     lse.fill_(-float("inf"))
 
+    if is_profiling: torch.cuda.nvtx.range_push('attention_loop')
     for t in range(num_tokens):
         indices = sparse_indices[t]  # [topk]
 
@@ -52,13 +55,20 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, ls
         qp = q_pe[t].to(torch.float32)  # [num_qo_heads, head_dim_kpe]
 
         # Compute attention logits
+        if is_profiling: torch.cuda.nvtx.range_push('compute_logits')
         logits = (qn @ Kc.T) + (qp @ Kp.T)  # [num_qo_heads, num_valid]
         logits_scaled = logits * sm_scale
+        if is_profiling: torch.cuda.nvtx.range_pop()
 
         # Compute 2-base LSE
+        if is_profiling: torch.cuda.nvtx.range_push('compute_lse')
         lse[t] = torch.logsumexp(logits_scaled, dim=-1) / math.log(2.0)
+        if is_profiling: torch.cuda.nvtx.range_pop()
 
         # Compute attention output
+        if is_profiling: torch.cuda.nvtx.range_push('compute_output')
         attn = torch.softmax(logits_scaled, dim=-1)  # [num_qo_heads, num_valid]
         out = attn @ Kc  # [num_qo_heads, head_dim_ckv]
         output[t] = out.to(torch.bfloat16)
+        if is_profiling: torch.cuda.nvtx.range_pop()
+    if is_profiling: torch.cuda.nvtx.range_pop()

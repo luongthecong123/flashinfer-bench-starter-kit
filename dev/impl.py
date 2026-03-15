@@ -53,7 +53,7 @@ def prepare_indices(sparse_indices):
 
 
 @torch.no_grad()
-def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, lse):
+def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, lse, is_profiling=False):
     num_tokens, num_qo_heads, head_dim_ckv = q_nope.shape
     head_dim_kpe = q_pe.shape[-1]
     num_pages, page_size, _ = ckv_cache.shape
@@ -70,16 +70,24 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, ls
     T = num_tokens
 
     # Flatten paged KV cache: [num_pages, 64, D] → [num_pages*64, D]
+    if is_profiling: torch.cuda.nvtx.range_push('flatten_kv_cache')
     Kc_all = ckv_cache.reshape(-1, head_dim_ckv)   # [total, 512] bf16
     Kp_all = kpe_cache.reshape(-1, head_dim_kpe)    # [total, 64]  bf16
+    if is_profiling: torch.cuda.nvtx.range_pop()
 
     # Fused mask + safe indices (single kernel instead of 2 separate ops)
+    if is_profiling: torch.cuda.nvtx.range_push('prepare_indices')
     mask, safe_indices = prepare_indices(sparse_indices)
+    if is_profiling: torch.cuda.nvtx.range_pop()
 
     # Batched gather: [T, 2048, D]
+    if is_profiling: torch.cuda.nvtx.range_push('gather')
     flat_idx = safe_indices.reshape(-1)
     Kc = Kc_all[flat_idx].reshape(T, topk, head_dim_ckv)
     Kp = Kp_all[flat_idx].reshape(T, topk, head_dim_kpe)
+    if is_profiling: torch.cuda.nvtx.range_pop()
 
     # Batched attention — writes directly into output/lse (no copy_out)
+    if is_profiling: torch.cuda.nvtx.range_push('compute_attention_batched')
     compute_attention_batched(q_nope, q_pe, Kc, Kp, mask, sm_scale, output, lse)
+    if is_profiling: torch.cuda.nvtx.range_pop()
