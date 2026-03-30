@@ -7,15 +7,15 @@ solution.json
 .github/
 archive/
 reports/
-dev/
-zen/
+profiling/
+# dev/
+# zen/
 assets/
 findings.md
 test_ncu*.py
 test_nsys*.py
 leep*
 s.cute*
-*.sh
 
 # CUDA build artifacts
 *.o

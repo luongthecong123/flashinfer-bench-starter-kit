@@ -1,5 +1,5 @@
 [solution]
-name = "cong-dsa-batched-v1"      # Solution name
+name = "cong-dsa-mixed"      # Solution name
 definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"  # Track definition
 author = "Cong"                   # Team/author name
 

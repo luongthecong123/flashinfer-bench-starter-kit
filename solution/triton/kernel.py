@@ -5,7 +5,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 
-# ── CuTe DSL Gather Kernel ────────────────────────────────────────────────────
+# ── Shared warp reduction ─────────────────────────────────────────────────────
 
 @cute.jit
 def warp_reduce(val: cute.Numeric, op: callable, width: cutlass.Constexpr = 32) -> cute.Numeric:
@@ -14,16 +14,13 @@ def warp_reduce(val: cute.Numeric, op: callable, width: cutlass.Constexpr = 32) 
     return val
 
 
-_GATHER_BM = 2
-_GATHER_THREADS = 256
-_GATHER_WARP_SIZE = cute.arch.WARP_SIZE
-
+# ── CuTe DSL Gather Kernel ────────────────────────────────────────────────────
 
 class Gather():
     def __init__(self):
-        self.BM = _GATHER_BM
-        self.num_threads = _GATHER_THREADS
-        self.warp_size = _GATHER_WARP_SIZE
+        self.BM = 2
+        self.num_threads = 256
+        self.warp_size = cute.arch.WARP_SIZE
 
     @cute.jit
     def __call__(
@@ -125,6 +122,159 @@ def _compile_gather():
 gather_compiled = _compile_gather()
 
 
+# ── CuTe DSL Fused Tiny Kernel (32-warp, for small T) ────────────────────────
+# Grid: [T, H, 1]  Block: 1024 threads = 32 warps
+# Each warp scores 1 key independently; 64 rounds cover 2048 keys.
+
+@cute.jit
+def fused_dsa_v2(
+    q_nope: cute.Tensor,
+    q_pe: cute.Tensor,
+    ckv_cache: cute.Tensor,
+    kpe_cache: cute.Tensor,
+    sparse_indices: cute.Tensor,
+    sm_scale: cutlass.Constexpr,
+    output: cute.Tensor,
+    lse: cute.Tensor,
+    stream,
+):
+    T, num_heads, head_dim_ckv = q_nope.shape
+    fused_dsa_kernel_v2(
+        q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, lse
+    ).launch(grid=[T, num_heads, 1], block=[1024, 1, 1], stream=stream)
+
+
+@cute.kernel
+def fused_dsa_kernel_v2(
+    q_nope: cute.Tensor,
+    q_pe: cute.Tensor,
+    ckv_cache: cute.Tensor,
+    kpe_cache: cute.Tensor,
+    sparse_indices: cute.Tensor,
+    sm_scale: cutlass.Constexpr,
+    output: cute.Tensor,
+    lse: cute.Tensor,
+):
+    T, num_heads, head_dim_ckv = q_nope.shape
+    head_dim_kpe = kpe_cache.shape[1]
+    top_k_len = 2048
+    num_warps = 32
+
+    bidx, bidy, _ = cute.arch.block_idx()
+    bdimx, _, _ = cute.arch.block_dim()
+    num_threads = bdimx
+    tidx, _, _ = cute.arch.thread_idx()
+    warp_idx = cute.arch.warp_idx()
+    warp_idx = cute.arch.make_warp_uniform(warp_idx)
+    wsize = cute.arch.WARP_SIZE
+
+    allocator = cutlass.utils.SmemAllocator()
+    smem_score_nope   = allocator.allocate_tensor(cutlass.Float32, cute.make_layout((top_k_len), stride=(1)), 16, None)
+    smem_score_pe     = allocator.allocate_tensor(cutlass.Float32, cute.make_layout((top_k_len), stride=(1)), 16, None)
+    smem_logits_scaled = allocator.allocate_tensor(cutlass.Float32, cute.make_layout((top_k_len), stride=(1)), 16, None)
+    smem_sparse_idx   = allocator.allocate_tensor(cutlass.Int32,   cute.make_layout((top_k_len), stride=(1)), 4,  None)
+    smem_valid_count  = allocator.allocate_tensor(cutlass.Int32,   cute.make_layout((1),         stride=(1)), 4,  None)
+
+    for i in range(tidx, top_k_len, num_threads):
+        smem_sparse_idx[i] = sparse_indices[bidx, i]
+    cute.arch.sync_threads()
+
+    q_nope_local = q_nope[bidx, bidy, None]
+    q_pe_local   = q_pe[bidx, bidy, None]
+
+    for round_idx in range(top_k_len // num_warps):
+        sparse_idx = round_idx * num_warps + warp_idx
+        cur_idx = smem_sparse_idx[sparse_idx]
+
+        if cur_idx >= cutlass.Int32(0):
+            lane_idx = cute.arch.lane_idx()
+
+            sum_partial_nope = cutlass.Float32(0)
+            for k_idx in range(head_dim_ckv // wsize):
+                sum_partial_nope += cutlass.Float32(q_nope_local[k_idx * wsize + lane_idx]) * \
+                                    cutlass.Float32(ckv_cache[cur_idx, k_idx * wsize + lane_idx])
+            sum_nope = warp_reduce(sum_partial_nope, lambda a, b: a + b, width=32)
+            if lane_idx == 0:
+                smem_score_nope[sparse_idx] = sum_nope
+
+            sum_partial_pe = cutlass.Float32(0)
+            for k_idx in range(head_dim_kpe // wsize):
+                sum_partial_pe += cutlass.Float32(q_pe_local[k_idx * wsize + lane_idx]) * \
+                                  cutlass.Float32(kpe_cache[cur_idx, k_idx * wsize + lane_idx])
+            sum_pe = warp_reduce(sum_partial_pe, lambda a, b: a + b, width=32)
+            if lane_idx == 0:
+                smem_score_pe[sparse_idx] = sum_pe
+
+    cute.arch.sync_threads()
+
+    if tidx == 0:
+        num_valid = cutlass.Int32(0)
+        for i in range(top_k_len):
+            if smem_sparse_idx[i] >= cutlass.Int32(0):
+                num_valid = cutlass.Int32(i + 1)
+        smem_valid_count[0] = num_valid
+    cute.arch.sync_threads()
+    valid_count = smem_valid_count[0]
+
+    for i in range(tidx, valid_count, num_threads):
+        smem_logits_scaled[i] = sm_scale * (smem_score_nope[i] + smem_score_pe[i])
+    cute.arch.sync_threads()
+
+    if tidx == 0:
+        row_max = smem_logits_scaled[0]
+        for i in range(valid_count):
+            if smem_logits_scaled[i] > row_max:
+                row_max = smem_logits_scaled[i]
+
+        row_sum = cutlass.Float32(0)
+        for i in range(valid_count):
+            row_sum += cute.math.exp(smem_logits_scaled[i] - row_max)
+
+        lse[bidx, bidy] = (row_max + cute.math.log(row_sum)) / cutlass.Float32(0.6931471805599453)
+
+        for i in range(valid_count):
+            smem_logits_scaled[i] = cute.math.exp(smem_logits_scaled[i] - row_max) / row_sum
+
+    cute.arch.sync_threads()
+
+    smem_output = allocator.allocate_tensor(cutlass.Float32, cute.make_layout((head_dim_ckv), stride=(1)), 16, None)
+    for i in range(tidx, head_dim_ckv, num_threads):
+        smem_output[i] = cutlass.Float32(0)
+    cute.arch.sync_threads()
+
+    for j in range(valid_count):
+        kv_idx = smem_sparse_idx[j]
+        attn_weight = smem_logits_scaled[j]
+        for i in range(tidx, head_dim_ckv, num_threads):
+            smem_output[i] += attn_weight * cutlass.Float32(ckv_cache[kv_idx, i])
+    cute.arch.sync_threads()
+
+    for i in range(tidx, head_dim_ckv, num_threads):
+        output[bidx, bidy, i] = cutlass.BFloat16(smem_output[i])
+
+
+def _compile_fused_tiny():
+    T = cute.sym_int()
+    N = cute.sym_int()
+    num_heads, head_dim_ckv, head_dim_kpe, top_k_len = 16, 512, 64, 2048
+    return cute.compile(
+        fused_dsa_v2,
+        _fake(cute.BFloat16, (T, num_heads, head_dim_ckv), (2, 1, 0), 16),
+        _fake(cute.BFloat16, (T, num_heads, head_dim_kpe), (2, 1, 0), 16),
+        _fake(cute.BFloat16, (N, head_dim_ckv),            (1, 0),    16),
+        _fake(cute.BFloat16, (N, head_dim_kpe),            (1, 0),    16),
+        _fake(cute.Int32,    (T, top_k_len),               (1, 0),    4),
+        0.1352337788608801,
+        _fake(cute.BFloat16, (T, num_heads, head_dim_ckv), (2, 1, 0), 16),
+        _fake(cute.Float32,  (T, num_heads),               (1, 0),    4),
+        make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi"
+    )
+
+
+fused_tiny_compiled = _compile_fused_tiny()
+
+
 # ── Torch Compile Attention ────────────────────────────────────────────────────
 
 @torch.compile
@@ -142,21 +292,22 @@ def compute_attention_batched(qn, qp, Kc, Kp, mask, sm_scale, output, lse):
 
 @torch.no_grad()
 def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, lse):
-    num_tokens, num_qo_heads, head_dim_ckv = q_nope.shape
-    head_dim_kpe = q_pe.shape[-1]
+    T = q_nope.shape[0]
+    head_dim_ckv = q_nope.shape[2]
+    head_dim_kpe = q_pe.shape[2]
     topk = sparse_indices.shape[-1]
-    T = num_tokens
 
-    # Flatten paged KV cache: [num_pages, 64, D] → [N, D]
-    Kc_all = ckv_cache.reshape(-1, head_dim_ckv)
-    Kp_all = kpe_cache.reshape(-1, head_dim_kpe)
+    ckv_flat = ckv_cache.reshape(-1, head_dim_ckv)
+    kpe_flat = kpe_cache.reshape(-1, head_dim_kpe)
 
-    # CuTe DSL gather kernel
-    Kc = torch.empty(T, topk, head_dim_ckv, dtype=torch.bfloat16, device="cuda")
-    Kp = torch.empty(T, topk, head_dim_kpe, dtype=torch.bfloat16, device="cuda")
-    max_valid = torch.empty(T, dtype=torch.int32, device="cuda")
-    gather_compiled(Kc_all, Kp_all, sparse_indices, Kc, Kp, max_valid)
-
-    # Build mask and run batched attention
-    mask = sparse_indices == -1
-    compute_attention_batched(q_nope, q_pe, Kc, Kp, mask, sm_scale, output, lse)
+    if T < 3:
+        # Small batch: single fused per-token kernel (32-warp, no gather overhead)
+        fused_tiny_compiled(q_nope, q_pe, ckv_flat, kpe_flat, sparse_indices, output, lse)
+    else:
+        # Large batch: parallel gather + batched torch.compile attention
+        Kc = torch.empty(T, topk, head_dim_ckv, dtype=torch.bfloat16, device="cuda")
+        Kp = torch.empty(T, topk, head_dim_kpe, dtype=torch.bfloat16, device="cuda")
+        max_valid = torch.empty(T, dtype=torch.int32, device="cuda")
+        gather_compiled(ckv_flat, kpe_flat, sparse_indices, Kc, Kp, max_valid)
+        mask = sparse_indices == -1
+        compute_attention_batched(q_nope, q_pe, Kc, Kp, mask, sm_scale, output, lse)
