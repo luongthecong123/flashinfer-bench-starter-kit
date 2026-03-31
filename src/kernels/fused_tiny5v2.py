@@ -1,3 +1,25 @@
+"""
+fused_tiny5v2: same as fused_tiny5 but uses cute.make_rmem_tensor for output accumulators.
+
+Key change vs fused_tiny3:
+  - Output phase: instead of `for j in range(valid_count): ... (serial HBM chain)`,
+    each warp accumulates its own keys in registers across num_rounds rounds,
+    then writes partial sums into smem_partial[32, 512], which is reduced by all 1024
+    threads into smem_output.
+
+  Why this helps:
+    - fused_tiny3 output: valid_count serial L2 reads, dependency chain ~173 ns each
+    - fused_tiny5 output: num_rounds independent L2 reads per warp (parallel),
+      final cross-warp reduce is pure smem reads (no L2 dependency chain)
+    - WL3 (valid=52): 52 serial iterations → 2 rounds × parallel, then 1 smem-only reduce
+
+Smem budget (per block):
+  Existing (~19 KB):  logits_scaled(8) + sparse_idx(8) + reductions(0.25) + output(2) + q_nope(1) + q_pe(0.125)
+  New:                smem_partial = 32 × 512 × 4B = 64 KB
+  Total: ~83 KB < 228 KB (B200)
+
+Grid: [T, 16, 1]  Block: 1024 threads = 32 warps
+"""
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
@@ -173,6 +195,15 @@ def fused_dsa_kernel_v5v2(
     cute.arch.sync_threads()
 
     # ── Output phase: per-warp register accumulation ──────────────────────────
+    # Each warp accumulates its own partial weighted sum in registers.
+    # Lane lane_idx of warp warp_idx owns dims: k*wsize + lane_idx for k in 0..dims_per_lane-1
+    # i.e. dims: lane_idx, lane_idx+32, lane_idx+64, ..., lane_idx+480
+    #
+    # For num_rounds rounds, warp w processes key (round*num_warps + w).
+    # No dependency between rounds — purely parallel within each warp.
+    # Final cross-warp reduce: smem_partial[w, :] → smem_output via 1024 threads.
+
+    # Register accumulator tile: each thread holds dims_per_lane fp32 registers
     out_regs = cute.make_rmem_tensor(
         cute.make_layout((dims_per_lane,), stride=(1,)),
         cutlass.Float32,
@@ -195,6 +226,8 @@ def fused_dsa_kernel_v5v2(
     cute.arch.sync_threads()
 
     # Cross-warp reduce: each of 1024 threads sums over 32 warps for its dim
+    # threads 0-511 handle dims 0-511; threads 512-1023 are parallel duplicates
+    # Use num_threads to cover all 512 dims with stride num_threads
     for i in range(tidx, head_dim_ckv, num_threads):
         acc = cutlass.Float32(0)
         for w in range(num_warps):

@@ -1,7 +1,6 @@
-"""DSA sparse attention using CuTe DSL fused_tiny2 kernel (32-warp parallel-keys)."""
+"""DSA sparse attention using fused_tiny5v4 kernel (smem-staged CKV output GEMV)."""
 import torch
-from src.kernels.fused_tiny2 import run
-
+from archive.fused_tiny5v7 import run
 
 if __name__ == "__main__":
     import sys

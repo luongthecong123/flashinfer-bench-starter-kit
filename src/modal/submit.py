@@ -9,7 +9,7 @@ from src.modal.modal_utils import app, trace_volume, image
 
 # ── Pick implementation (override via env: IMPL_MODULE=src.toco_impl modal run submit.py) ──
 import os
-IMPL_MODULE = os.environ.get("IMPL_MODULE", "src.gather_dsa_impl")
+IMPL_MODULE = os.environ.get("IMPL_MODULE", "src.fused_tiny_impl")
 
 
 @app.function(image=image, gpu="B200:1", timeout=600, volumes={"/data": trace_volume})
