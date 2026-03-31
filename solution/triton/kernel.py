@@ -15,7 +15,6 @@ def warp_reduce(val: cute.Numeric, op: callable, width: cutlass.Constexpr = 32) 
 
 BLOCK_SIZE = 1024
 NUM_WARPS  = BLOCK_SIZE // 32   # 32
-# Each lane of a warp owns 512/32 = 16 output dimensions
 DIMS_PER_LANE: cutlass.Constexpr = 512 // 32   # 16
 
 
