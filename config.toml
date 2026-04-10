@@ -4,5 +4,7 @@ definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"  # Track defi
 author = "Cong"                   # Team/author name
 
 [build]
+#language = "cuda"                 # triton | cuda
+#entry_point = "kernel4.cu::kernel"     
 language = "triton"               # triton | cuda
-entry_point = "kernel.py::run"    # Kernel function name
+entry_point = "kernel5.py::run"           

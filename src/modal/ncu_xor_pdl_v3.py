@@ -1,15 +1,14 @@
-"""NCU profiling on Modal B200.
-Change IMPL_MODULE / WORKLOAD_IDX to select the implementation and workload.
-Usage: modal run src/modal/ncu.py
+"""NCU profiling for kv_split_xor_pdl_v3 on Modal B200.
+Usage: modal run src/modal/ncu_xor_pdl_v3.py
 """
 import sys, os
 if os.path.isdir("/app"):
     sys.path.insert(0, "/app")
-from src.modal.modal_utils import app, trace_volume, image
+from src.modal.modal_utils import app, trace_volume, image, get_ncu_compute_cmd
 
 # ── Pick implementation ──
-IMPL_MODULE  = "src.kernels.fused_tiny5v7"
-WORKLOAD_IDX = 2   # WL3: b7668cfd  T=2  MaxValid=[33,52]
+IMPL_MODULE  = "src.kernels.kv_split_xor_pdl_v3"
+WORKLOAD_IDX = 22   # WL23: 2207f0fd  T=7  MaxValid=[415,131,2011,148,263,169,462]
 
 # Inline script written to /tmp at runtime — no profiler.py dependency.
 _RUN_ONCE = """\
@@ -53,15 +52,6 @@ run(q_nope, q_pe, ckv, kpe, si, SCALE, output, lse)
 """
 
 
-# _RUN_ONCE = """\
-# import torch
-# M, N, K = 16, 512, 2048
-# A = torch.randn((K, M), device="cuda", dtype=torch.float32)
-# B_ = torch.randn((K, N), device="cuda", dtype=torch.float32)
-# C = torch.mm(A.T, B_)
-# """
-
-
 @app.function(image=image, gpu="B200:1", timeout=600, volumes={"/data": trace_volume})
 def run_ncu(impl_module: str, workload_idx: int):
     import subprocess, glob, os, csv, io
@@ -75,13 +65,7 @@ def run_ncu(impl_module: str, workload_idx: int):
            "WORKLOAD_IDX": str(workload_idx),
            "CONTEST_DIR": "/data",
            "IMPL_MODULE": impl_module}
-    cmd = [ncu, "--set", "full", "--target-processes", "all",
-           "--print-summary", "per-kernel",
-           "--kernel-name", "regex:.*(nvjet|cublas|cudnn|cutlass|gemm|Gemm|GEMM|sgemm|dgemm|hgemm|bmm|triton).*",
-           "--import-source", "yes",
-           "--source-folders", "/app/src",
-           "-f", "--export", "/tmp/ncu_out",
-           "python", target]
+    cmd = get_ncu_compute_cmd(ncu, target, "/tmp/ncu_out")
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=540, env=env, cwd="/app/src")
     print(r.stdout[-5000:] if len(r.stdout) > 5000 else r.stdout)
     if r.stderr:
@@ -122,7 +106,6 @@ def run_ncu(impl_module: str, workload_idx: int):
 
 @app.local_entrypoint()
 def main():
-    # for WORKLOAD_IDX in range(8):
     data = run_ncu.remote(IMPL_MODULE, WORKLOAD_IDX)
     if data:
         impl_short = IMPL_MODULE.split(".")[-1]

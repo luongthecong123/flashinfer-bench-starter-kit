@@ -109,14 +109,33 @@ def pretty_diff(name, ref, impl):
         d = abs(r[j].item() - i[j].item())
         print(f"  {j:>5} {r[j].item():>12.6f} {i[j].item():>12.6f} {d:>12.2e}")
 
-def bench(fn, args, warmup=10, iters=50):
-    for _ in range(warmup): fn(*args)
+def _clone_args(args):
+    return [a.clone() if isinstance(a, torch.Tensor) else a for a in args]
+
+def bench(fn, args, warmup=3, iters=100):
+    """Benchmark matching flashinfer_bench methodology: L2 flush, arg clone, pre-sync."""
+    # 256MB cache-clearing buffer (same as flashinfer_bench)
+    cache = torch.empty(256 * 1024 * 1024 // 4, dtype=torch.int, device="cuda")
+
+    # Warmup with cache clearing
+    for _ in range(warmup):
+        cache.zero_()
+        fn(*_clone_args(args))
     torch.cuda.synchronize()
-    evs = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(iters)]
-    for s, e in evs:
-        s.record(); fn(*args); e.record()
+
+    # Timed iterations with cache clearing, arg cloning, pre-sync
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    end_events   = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    for i in range(iters):
+        cache.zero_()
+        cloned = _clone_args(args)
+        torch.cuda.synchronize()
+        start_events[i].record()
+        fn(*cloned)
+        end_events[i].record()
     torch.cuda.synchronize()
-    return sum(s.elapsed_time(e) for s, e in evs) / iters
+    times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+    return sum(times) / len(times)
 
 # ────────────────────────────────────────────
 def main():
@@ -183,14 +202,12 @@ def main():
                 continue
 
         if MEASURE:
-            def run_ref(qn, qp, c, k, s):
-                o, l = alloc_out(qn.shape[0])
-                ref_fn(qn, qp, c, k, s, SCALE, o, l)
-            def run_impl(qn, qp, c, k, s):
-                o, l = alloc_out(qn.shape[0])
-                impl_fn(qn, qp, c, k, s, SCALE, o, l)
-            r_ms = bench(run_ref, args)
-            i_ms = bench(run_impl, args)
+            r_out, r_lse = alloc_out(T)
+            i_out, i_lse = alloc_out(T)
+            ref_args  = (*args, SCALE, r_out, r_lse)
+            impl_args = (*args, SCALE, i_out, i_lse)
+            r_ms = bench(ref_fn,  ref_args)
+            i_ms = bench(impl_fn, impl_args)
             sp = r_ms / i_ms if i_ms > 0 else 0
             gf = fl / (i_ms * 1e-3) / 1e9 if i_ms > 0 else 0
             line += f" {r_ms:>8.3f} {i_ms:>8.3f} {sp:>7.2f}x {gf:>8.2f}"
@@ -205,6 +222,18 @@ def main():
 
     if CHECK:
         print(f"\n{'ALL PASS' if all_pass else 'SOME FAILED'}")
+
+    # ── Return structured results for programmatic use ──
+    results = []
+    for idx in range(len(workloads)):
+        ax = workloads[idx]["workload"]["axes"]
+        uuid = workloads[idx]["workload"]["uuid"][:8]
+        r = {"workload": idx + 1, "uuid": uuid, "T": ax["num_tokens"]}
+        if idx < len(speedups):
+            r["ref_ms"] = ref_ms_list[idx]
+            r["impl_ms"] = durations[idx]
+            r["speedup"] = speedups[idx]
+        results.append(r)
 
     if MEASURE and durations:
         import math as _math
@@ -230,3 +259,5 @@ def main():
             row += f" {rms:>8.3f} {ims:>8.3f} {sp:>7.2f}x {gf:>8.2f}"
             row += f"  [{mv:.0f}]"
             print(row)
+
+    return {"all_pass": all_pass, "results": results}

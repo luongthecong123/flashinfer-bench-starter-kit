@@ -26,8 +26,12 @@ trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True
 TRACE_SET_PATH = "/data"
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.from_registry(
+        "nvidia/cuda:13.1.0-devel-ubuntu22.04",
+        add_python="3.12",
+    )
     .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    .env({"CUDA_HOME": "/usr/local/cuda"})
 )
 
 
@@ -95,6 +99,8 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None, max_worklo
             if entry.get("speedup_factor") is not None:
                 msg += f" | {entry['speedup_factor']:.2f}x speedup"
             print(msg, flush=True)
+            if status == "COMPILE_ERROR" and trace.evaluation.log:
+                print(f"    LOG: {trace.evaluation.log[:2000]}", flush=True)
 
     print(f"\nDone! {len(results[definition.name])} workloads processed.", flush=True)
     return results
