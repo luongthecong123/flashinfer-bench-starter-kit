@@ -112,7 +112,7 @@ def pretty_diff(name, ref, impl):
 def _clone_args(args):
     return [a.clone() if isinstance(a, torch.Tensor) else a for a in args]
 
-def bench(fn, args, warmup=3, iters=100):
+def bench(fn, args, warmup=3, iters=50):
     """Benchmark matching flashinfer_bench methodology: L2 flush, arg clone, pre-sync."""
     # 256MB cache-clearing buffer (same as flashinfer_bench)
     cache = torch.empty(256 * 1024 * 1024 // 4, dtype=torch.int, device="cuda")

@@ -1,3 +1,10 @@
+```bash
+git add -A && git commit -m "submission-v9"
+git tag -a "submission-v9" -m "submission-v9" && git push && git push --tags
+```
+
+
+
 # [FlashInfer AI Kernel Generation Contest @ MLSys 2026](http://mlsys26.flashinfer.ai/)
 
 Create high-performance GPU kernels for state-of-the-art LLM architectures on NVIDIA Blackwell GPUs with humans and/or AI agents.

@@ -52,7 +52,7 @@ ROWS_PER_WARP = 4                               # rows batched per warp per roun
 ROWS_PER_ROUND_SCORE = NUM_WARPS * ROWS_PER_WARP  # 128
 
 # BF16 accumulation chunk size — tune for precision vs throughput
-NUM_VEC_BF16 = 2
+NUM_VEC_BF16 = 8
 
 
 @cute.jit

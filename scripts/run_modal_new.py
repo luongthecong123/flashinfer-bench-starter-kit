@@ -1,37 +1,40 @@
 """
-FlashInfer-Bench Modal Cloud Benchmark Runner.
+FlashInfer-Bench Modal Cloud Benchmark Runner — Baseline Comparison.
 
-Automatically packs the solution from source files and runs benchmarks
-on NVIDIA B200 GPUs via Modal.
+Runs the official FlashInfer baseline solution (flashinfer_wrapper_5af199)
+against the same 23 workloads, using the flashinfer package.
 
-Setup (one-time):
-    modal setup
-    modal volume create flashinfer-trace
-    modal volume put flashinfer-trace /path/to/flashinfer-trace/
+Usage:
+    modal run scripts/run_modal_new.py
+
+    # Limit workloads for a quick test:
+    MAX_WORKLOADS=3 modal run scripts/run_modal_new.py
 """
 
 import sys
 from pathlib import Path
 
-# Add project root to path for imports
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import modal
 from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 
-app = modal.App("flashinfer-bench")
+app = modal.App("flashinfer-bench-baseline")
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
 
+# Same base image but with flashinfer added from its official wheel index
 image = (
     modal.Image.from_registry(
         "nvidia/cuda:13.1.0-devel-ubuntu22.04",
         add_python="3.12",
     )
-    .apt_install("git")
-    .pip_install("flashinfer-bench @ git+https://github.com/flashinfer-ai/flashinfer-bench.git@main", "torch", "triton", "numpy", "cupti-python")
+    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    .run_commands(
+        "pip install flashinfer-python -i https://flashinfer.ai/whl/cu128/torch2.8/ --no-build-isolation"
+    )
     .env({"CUDA_HOME": "/usr/local/cuda"})
 )
 
@@ -39,8 +42,6 @@ image = (
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None, max_workloads: int = 0) -> dict:
     """Run benchmark on Modal B200 and return results."""
-    import sys
-    
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
@@ -57,7 +58,6 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None, max_worklo
 
     print(f"Found {len(workloads)} workloads for {solution.definition}", flush=True)
 
-    # Limit number of workloads for quick testing
     if max_workloads > 0:
         workloads = workloads[:max_workloads]
         print(f"Limiting to {len(workloads)} workload(s)", flush=True)
@@ -91,8 +91,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None, max_worklo
                 entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
                 entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
             results[definition.name][trace.workload.uuid] = entry
-            
-            # Print progress for each workload
+
             status = entry["status"]
             msg = f"  [{i+1}/{len(traces)}] Workload {trace.workload.uuid[:8]}...: {status}"
             if entry.get("latency_ms") is not None:
@@ -100,38 +99,31 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None, max_worklo
             if entry.get("speedup_factor") is not None:
                 msg += f" | {entry['speedup_factor']:.2f}x speedup"
             print(msg, flush=True)
-            if status == "COMPILE_ERROR" and trace.evaluation.log:
-                print(f"    LOG: {trace.evaluation.log[:2000]}", flush=True)
+            if status in ("COMPILE_ERROR", "RUNTIME_ERROR") and trace.evaluation.log:
+                print(f"    LOG: {trace.evaluation.log[-4000:]}", flush=True)
 
     print(f"\nDone! {len(results[definition.name])} workloads processed.", flush=True)
     return results
 
 
 def print_results(results: dict):
-    """Print benchmark results in a formatted way."""
     for def_name, traces in results.items():
         print(f"\n{def_name}:")
         for workload_uuid, result in traces.items():
             status = result.get("status")
             print(f"  Workload {workload_uuid[:8]}...: {status}", end="")
-
             if result.get("latency_ms") is not None:
                 print(f" | {result['latency_ms']:.3f} ms", end="")
-
             if result.get("speedup_factor") is not None:
                 print(f" | {result['speedup_factor']:.2f}x speedup", end="")
-
             if result.get("max_abs_error") is not None:
-                abs_err = result["max_abs_error"]
-                rel_err = result.get("max_rel_error", 0)
-                print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
-
+                print(f" | abs_err={result['max_abs_error']:.2e}, rel_err={result.get('max_rel_error', 0):.2e}", end="")
             print()
 
 
 @app.local_entrypoint()
 def main():
-    """Pack solution and run benchmark on Modal."""
+    import os
     from scripts.pack_solution import pack_solution
 
     print("Packing solution from source files...")
@@ -141,10 +133,8 @@ def main():
     solution = Solution.model_validate_json(solution_path.read_text())
     print(f"Loaded: {solution.name} ({solution.definition})")
 
-    import os
     max_workloads = int(os.environ.get("MAX_WORKLOADS", 0))
-
-    print(f"\nRunning benchmark on Modal B200... (max_workloads={max_workloads or 'all'})")
+    print(f"\nRunning benchmark on Modal B200 (flashinfer image)... (max_workloads={max_workloads or 'all'})")
     results = run_benchmark.remote(solution, max_workloads=max_workloads)
 
     if not results:
