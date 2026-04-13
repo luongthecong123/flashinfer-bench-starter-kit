@@ -9,8 +9,8 @@ from src.modal.modal_utils import app, trace_volume, image
 
 # ── Pick implementation ──
 IMPL_MODULE = os.environ.get("IMPL_MODULE", "src.kernels.idxer_tc")
-START = int(os.environ.get("START", 30))   # 0-indexed
-END   = int(os.environ.get("END", 80))     # 0 = all
+START = int(os.environ.get("START", 0))   # 0-indexed
+END   = int(os.environ.get("END", 0))     # 0 = all
 
 print("IMPL_MODULE: ", IMPL_MODULE)
 print(f"RANGE: {START}..{END or 'end'}")

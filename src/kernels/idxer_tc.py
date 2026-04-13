@@ -5,7 +5,7 @@ HEAD_DIM = 128
 NUM_HEADS = 64
 TOPK = 2048
 
-
+@torch.compile
 def dequant_fp8_kv_cache(k_index_cache_fp8):
     k_index_cache_fp8 = k_index_cache_fp8.view(torch.uint8)
     num_pages, page_size, num_heads, head_dim_sf = k_index_cache_fp8.shape
@@ -39,6 +39,20 @@ def _score_and_reduce(q, K_gathered, weights, mask):
     # mask padding to -inf so topk ignores them
     final.masked_fill_(mask, float("-inf"))
     return final
+
+
+@torch.compile
+def _topk_remap_and_write(final, block_table, mask, topk_indices, topk, page_size):
+    actual_k = min(topk, final.shape[1])
+    _, topk_idx = torch.topk(final, actual_k, dim=1)
+    topk_page = topk_idx // page_size
+    topk_off = topk_idx % page_size
+    global_pages = torch.gather(block_table, 1, topk_page)
+    global_tokens = (global_pages * page_size + topk_off).to(torch.int32)
+    invalid = torch.gather(mask, 1, topk_idx)
+    global_tokens[invalid] = -1
+    topk_indices.fill_(-1)
+    topk_indices[:, :actual_k] = global_tokens
 
 
 @torch.no_grad()
@@ -75,20 +89,5 @@ def run(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_ind
     # Score + reduce
     final = _score_and_reduce(q, K_gathered, weights, mask)
 
-    # Top-k
-    actual_k = min(TOPK, max_sl)
-    _, topk_idx = torch.topk(final, actual_k, dim=1)  # [B, actual_k] local indices
-
-    # Remap local token indices -> global page*64+offset
-    topk_page = topk_idx // PAGE_SIZE          # which page slot in block_table
-    topk_off = topk_idx % PAGE_SIZE            # offset within page
-    # Gather page indices from block_table: [B, actual_k]
-    global_pages = torch.gather(block_table.long(), 1, topk_page)
-    global_tokens = (global_pages * PAGE_SIZE + topk_off).to(torch.int32)
-
-    # Mask out invalid (where topk picked a padding slot, score was -inf)
-    invalid = torch.gather(mask, 1, topk_idx)
-    global_tokens[invalid] = -1
-
-    topk_indices.fill_(-1)
-    topk_indices[:, :actual_k] = global_tokens
+    # Top-k + remap + write output
+    _topk_remap_and_write(final, block_table.long(), mask, topk_indices, TOPK, PAGE_SIZE)

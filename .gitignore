@@ -24,6 +24,7 @@ s.cute*
 *.fatbin
 *.ptx
 *.nsys-rep
+*.csv
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
