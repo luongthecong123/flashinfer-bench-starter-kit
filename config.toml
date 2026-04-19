@@ -1,19 +1,19 @@
 # === ATTENTION (tag: submission-v<version>)
-# [solution]
-# name = "cong-dsa-attention"
-# definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"
-# author = "Cong"
-
-# [build]
-# language = "triton"
-# entry_point = "kernel5cl.py::run"
-
-# === INDEXER (tag: submission-idxer-v<version>)
 [solution]
-name = "cong-dsa-indexer"
-definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
+name = "cong-dsa-attention"
+definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"
 author = "Cong"
 
 [build]
 language = "triton"
-entry_point = "idxer.py::run"
+entry_point = "kernel5cl_1024.py::run"
+
+# === INDEXER (tag: submission-idxer-v<version>)
+# [solution]
+# name = "cong-dsa-indexer"
+# definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
+# author = "Cong"
+
+# [build]
+# language = "triton"
+# entry_point = "idxer.py::run"

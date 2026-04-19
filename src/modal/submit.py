@@ -15,8 +15,8 @@ import os
 # IMPL_MODULE = os.environ.get("IMPL_MODULE", "src.kernels.kv_split_v3_thr_warpv3_clc_pdl") # a few cases have nan output
 # IMPL_MODULE = os.environ.get("IMPL_MODULE", "src.kernels.kv_split_v3_thr_warpv3_clc_upfront") # Correct code
 # IMPL_MODULE = os.environ.get("IMPL_MODULE", "src.kernels.kv_split_v3_thr_warpv3_pdl")
-IMPL_MODULE = os.environ.get("IMPL_MODULE", "src.kernels.kv_split_xor")
-# IMPL_MODULE = os.environ.get("IMPL_MODULE", "src.kernels.kv_split_xor_skew")
+IMPL_MODULE = os.environ.get("IMPL_MODULE", "src.kernels.kv_split_xor_pdl_v3_pro_v2_1024T")
+# IMPL_MODULE = os.environ.get("IMPL_MODULE", "src.kernels.dsa")
 # IMPL_MODULE = os.environ.get("IMPL_MODULE", "src.kernels.kv_split_xor_pdl")
 # IMPL_MODULE = os.environ.get("IMPL_MODULE", "src.kernels.kv_split_xor_pdl_v3_pro_v2")
 # IMPL_MODULE = os.environ.get("IMPL_MODULE", "src.kernels.kv_split_xor_sentinel") # sentinel-skip variant of kv_split_xor

@@ -8,7 +8,7 @@ if os.path.isdir("/app"):
 from src.modal.modal_utils import app, trace_volume, image
 
 # ── Pick implementation ──
-IMPL_MODULE = os.environ.get("IMPL_MODULE", "src.kernels.idxer_tc")
+IMPL_MODULE = os.environ.get("IMPL_MODULE", "src.kernels.idxer_tc_skip")
 START = int(os.environ.get("START", 0))   # 0-indexed
 END   = int(os.environ.get("END", 0))     # 0 = all
 
