@@ -2,29 +2,41 @@ import math
 import torch
 import cutlass
 import cutlass.cute as cute
+import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.utils as utils
+import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op, T
 
 TOP_K = 2048
-LIMIT_REQUEST = 32
-LIMIT_SEQ_LEN = 6400
+LIMIT_REQUEST = 128
+LIMIT_SEQ_LEN = 640000
 DIM_SPLIT = 128
 PAGE_SIZE = 64
 NUM_HEADS  = 64
 HEAD_DIM   = 128
 
-# Score-kernel constants
-ROW_STRIDE     = HEAD_DIM + 4        # 132 bytes per row (HEAD_DIM fp8 + 4B scale)
+# Score-kernel constants (mirrored from score_scale_full_bt_ws_cpasync_persist.py)
+ROW_STRIDE     = HEAD_DIM + 4   # 132 bytes per row (HEAD_DIM fp8 + 4B scale)
 PAGES_PER_TILE = DIM_SPLIT // PAGE_SIZE   # 2
-BM             = DIM_SPLIT            # 128 — M tile (tokens per split)
-BN             = NUM_HEADS            # 64  — N tile (one q tile)
-PAGE_BYTES     = PAGE_SIZE * ROW_STRIDE   # 8448 bytes per page
-FP8_REGION     = PAGE_SIZE * HEAD_DIM    # 8192 bytes fp8 per page
-NUM_VEC        = 4
-K_ITERS        = HEAD_DIM // NUM_VEC  # 32
+BM             = DIM_SPLIT       # 128 — M tile (tokens per split)
+BN             = NUM_HEADS       # 64  — N tile (one q tile)
+BK             = HEAD_DIM        # 128 — K tile
+MMA_INST_MNK   = (128, 64, 32)
+TMEM_LD_REP    = BN
+HEAD_DIM_I32   = HEAD_DIM // 4   # 32
+ROW_STRIDE_I32 = ROW_STRIDE // 4 # 33
+INIT_BAR_ID    = 1
 
+
+@dsl_user_op
+def tcgen05_fence(*, loc=None, ip=None):
+    llvm.inline_asm(None, [],
+        "tcgen05.fence::after_thread_sync;", "",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
 
 @dsl_user_op
 def float_to_radix(v: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Uint32:
@@ -68,13 +80,19 @@ def count_element(bits, desired, desired_mask, digit_pos_u, c0, c1, c2, c3):
     return c0, c1, c2, c3
 
 
+@cute.struct
+class ScoreSharedStorage:
+    mma_mbar_ptr:     cute.struct.MemRange[cutlass.Int64, 2]
+    tmem_holding_buf: cutlass.Int32
+
+
 class Indexer_kvsplit:    
     def __init__(self):
         self.top_k = TOP_K
         self.dim_split = DIM_SPLIT
         self.page_size = PAGE_SIZE
         
-        self.indexer_threads = 128
+        self.indexer_threads = 512
         self.pass_through_threads = 1024
         self.topk_threads = 1024
         
@@ -83,6 +101,14 @@ class Indexer_kvsplit:
         self.limit_request = LIMIT_REQUEST
         self.limit_seq_len = LIMIT_SEQ_LEN
 
+        # Score-kernel MMA params
+        self.fp8_dtype          = cutlass.Float8E4M3FN
+        self.acc_dtype          = cutlass.Float32
+        self.num_stages         = 1
+        self.tmem_ld_rep        = TMEM_LD_REP
+        self.cta_tile_mnk       = (BM, BN, BK)
+        self.mma_inst_shape_mnk = MMA_INST_MNK
+        
         # Workspace
         self.ws_score_output = torch.empty(LIMIT_REQUEST, LIMIT_SEQ_LEN, dtype=torch.float32, device="cuda")
         
@@ -103,6 +129,19 @@ class Indexer_kvsplit:
         pages_per_split = self.dim_split // self.page_size
         num_splits = (max_num_pages + pages_per_split - 1) // pages_per_split
 
+        # Build score-kernel MMA + smem layouts (compile-time, hoisted out of
+        # dynamic if-else so self isn't mutated within a dynamic branch).
+        op = tcgen05.MmaFP8Op(
+            self.fp8_dtype, self.acc_dtype, self.mma_inst_shape_mnk,
+            tcgen05.CtaGroup.ONE, tcgen05.OperandSource.SMEM,
+            tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.K,
+        )
+        tiled_mma     = cute.make_tiled_mma(op)
+        a_smem_layout = sm100_utils.make_smem_layout_a(
+            tiled_mma, self.cta_tile_mnk, self.fp8_dtype, self.num_stages)
+        b_smem_layout = sm100_utils.make_smem_layout_b(
+            tiled_mma, self.cta_tile_mnk, q_index_fp8.element_type, self.num_stages)
+
         if max_num_pages <= 32:
             self.pass_through_kernel(seq_lens, block_table, top_k_indices).launch(
                 grid=[T, 1, 1], block=[1024, 1, 1], stream=stream
@@ -111,6 +150,7 @@ class Indexer_kvsplit:
             self.indexer_ksplit_kernel(
                 q_index_fp8, k_index_cache_fp8, weights,
                 seq_lens, block_table, num_splits, score_output, top_k_indices,
+                tiled_mma, a_smem_layout, b_smem_layout,
             ).launch(
                 grid=[T + num_splits, 1, 1], block=[self.indexer_threads, 1, 1], stream=stream
             )
@@ -180,6 +220,9 @@ class Indexer_kvsplit:
         num_splits,         # int32
         score_output,       # (MAX_REQUEST, MAX_SEQ_LEN) f32
         topk_indices,       # (T, 2048) Int32
+        tiled_mma,
+        a_smem_layout,
+        b_smem_layout,
     ):
         top_k_len:      cutlass.Constexpr = self.top_k
         limit_request:      cutlass.Constexpr = self.limit_request
@@ -193,10 +236,44 @@ class Indexer_kvsplit:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane_idx = cute.arch.lane_idx()        
         
-        # ── SMEM allocation ──
+        # ── SMEM allocation (order matters for sB swizzle alignment) ──
+        # sA  : at offset 0       — Sw<3,2,3>∘row_major i32 view safe (offset 0)
+        # storage : mbar+tmem buf
+        # sB  : 1024-aligned      — Sw<3,2,3> i32 view safe (multiple of swizzle period)
+        # sScales, sWeights       — score-path scratch
+        # smem_indexer_T_idx, smem_num_idxer — score-path metadata
+        # smem_sparse, smem_page  — pass-through scratch
         alloc = cutlass.utils.SmemAllocator()
+        sA = alloc.allocate_tensor(
+            element_type=self.fp8_dtype, layout=a_smem_layout.outer,
+            byte_alignment=128, swizzle=a_smem_layout.inner,
+        )
+        sA_load_layout = cute.make_composed_layout(
+            cute.make_swizzle(3, 2, 3), 0,
+            cute.make_layout((BM, HEAD_DIM_I32), stride=(HEAD_DIM_I32, 1)),
+        )
+        sA_load = cute.make_tensor(
+            cute.recast_ptr(sA.iterator, dtype=cutlass.Int32), sA_load_layout)
+
+        sMmaMbar = alloc.allocate_tensor(
+            cutlass.Int64, cute.make_layout(2 * self.num_stages), 16, None)
+        sTmemHold = alloc.allocate_tensor(
+            cutlass.Int32, cute.make_layout(1), 16, None)
+
+        sB = alloc.allocate_tensor(
+            self.fp8_dtype, b_smem_layout.outer, 1024, b_smem_layout.inner)
+        sB_load_layout = cute.make_composed_layout(
+            cute.make_swizzle(3, 2, 3), 0,
+            cute.make_layout((BN, HEAD_DIM_I32), stride=(HEAD_DIM_I32, 1)),
+        )
+        sB_load = cute.make_tensor(
+            cute.recast_ptr(sB.iterator, dtype=cutlass.Int32), sB_load_layout)
+
+        sScales  = alloc.allocate_tensor(cutlass.Float32,
+                       cute.make_layout(self.indexer_threads), 16, None)
         sWeights = alloc.allocate_tensor(cutlass.Float32,
                        cute.make_layout(BN), 16, None)
+
         smem_indexer_T_idx = self._smem(alloc, cutlass.Int32, (limit_request,), (1,), 4)
         smem_num_idxer     = self._smem(alloc, cutlass.Int32, (1,),             (1,), 4)
         smem_sparse        = self._smem(alloc, cutlass.Int32, (top_k_len, ),      (1,), 4)
@@ -222,13 +299,17 @@ class Indexer_kvsplit:
                     
                 cute.arch.sync_threads()
                 
-                # Thread-stride loop: covers all tokens regardless of num_warps
-                for token_idx in range(tidx, max_seq_len, self.indexer_threads):
-                    page_local  = token_idx // cutlass.Int32(PAGE_SIZE)
-                    tok_off     = token_idx - page_local * cutlass.Int32(PAGE_SIZE)
-                    global_page = smem_page[page_local]
-                    smem_sparse[token_idx] = global_page * cutlass.Int32(PAGE_SIZE) + tok_off
-
+                # Each warp handles one page; guard against warps beyond max_num_pages
+                if warp_idx < max_num_pages:
+                    page_idx   = smem_page[warp_idx]
+                    page_start = warp_idx * cutlass.Int32(PAGE_SIZE)
+                    page_end   = page_start + cutlass.Int32(PAGE_SIZE)
+                    if page_end > max_seq_len:
+                        page_end = max_seq_len
+                    for i in range(lane_idx, page_end - page_start, self.wsize):
+                        token_idx = page_start + i
+                        if token_idx < max_seq_len:
+                            smem_sparse[token_idx] = page_idx * cutlass.Int32(PAGE_SIZE) + i
                 cute.arch.sync_threads()
                 
                 for i in range(tidx, top_k_len, self.indexer_threads):
@@ -263,10 +344,75 @@ class Indexer_kvsplit:
             cute.arch.sync_threads()
             num_idxer_requests = smem_num_idxer[0]
 
-            num_vec:  cutlass.Constexpr = NUM_VEC
-            k_iters:  cutlass.Constexpr = K_ITERS
+            # ── Score path one-time setup (mirrors score_scale_full_bt_ws_cpasync_persist.py) ──
+            tCrA   = tiled_mma.make_fragment_A(sA)
+            tCrB   = tiled_mma.make_fragment_B(sB)
+            acc_shape       = tiled_mma.partition_shape_C(self.cta_tile_mnk[:2])
+            tCtAcc          = tiled_mma.make_fragment_C(acc_shape)
+            num_tmem_cols   = utils.get_num_tmem_alloc_cols(tCtAcc)
+            tmem_alloc_cols = cutlass.Int32(num_tmem_cols)
 
-            # ── Persistent loop over indexer requests (SIMT) ──
+            mma_mbar = sMmaMbar.iterator
+
+            if warp_idx == 0:
+                cute.arch.alloc_tmem(tmem_alloc_cols, sTmemHold.iterator)
+                if tidx == 0:
+                    cute.arch.mbarrier_init(mma_mbar, cnt=1)
+                    cute.arch.mbarrier_init_fence()
+
+            cute.arch.barrier(barrier_id=INIT_BAR_ID,
+                              number_of_threads=self.indexer_threads)
+
+            tmem_ptr = cute.arch.retrieve_tmem_ptr(self.acc_dtype, alignment=16,
+                ptr_to_buffer_holding_addr=sTmemHold.iterator)
+            tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc.layout)
+
+            # TMEM epilogue plumbing (constant across iters)
+            M_acc = cute.size(tCtAcc, mode=[0, 0])
+            ld_op = tcgen05.Ld32x32bOp(tcgen05.Repetition(self.tmem_ld_rep))
+            epi_tiler  = ((M_acc, self.tmem_ld_rep),)
+            tCtAcc_epi = cute.zipped_divide(tCtAcc, epi_tiler)
+            copy_atom_t2r   = cute.make_copy_atom(ld_op, self.acc_dtype)
+            tmem_tiled_copy = tcgen05.make_tmem_copy(copy_atom_t2r, tCtAcc_epi[None, 0])
+            tmem_thr_copy   = tmem_tiled_copy.get_slice(tidx)
+            tTR_tAcc        = tmem_thr_copy.partition_S(tCtAcc_epi)
+            tTR_rAcc        = cute.make_rmem_tensor(tTR_tAcc[None, None, 0].shape, self.acc_dtype)
+
+            # cp.async A copy plumbing (constant across iters)
+            atom_cpa = cute.make_copy_atom(
+                cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.ALWAYS),
+                cutlass.Int32, num_bits_per_copy=cutlass.Int32.width,
+            )
+            N_PER_THREAD_I32 = (BM * HEAD_DIM_I32) // self.indexer_threads   # 8
+            thr_layout_load  = cute.make_layout((16, HEAD_DIM_I32),
+                                                stride=(HEAD_DIM_I32, 1))
+            val_layout_load  = cute.make_layout((N_PER_THREAD_I32, 1),
+                                                stride=(1, 1))
+            tiled_copy_a = cute.make_tiled_copy_tv(atom_cpa, thr_layout_load, val_layout_load)
+            thr_copy_a   = tiled_copy_a.get_slice(tidx)
+            tAsA = thr_copy_a.partition_D(sA_load)
+
+            # cp.async B (q) plumbing
+            N_PER_THREAD_I32_B = (BN * HEAD_DIM_I32) // self.indexer_threads   # 4
+            atom_cpb = cute.make_copy_atom(
+                cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.ALWAYS),
+                cutlass.Int32, num_bits_per_copy=cutlass.Int32.width,
+            )
+            thr_layout_load_b = cute.make_layout(
+                (BN, HEAD_DIM_I32 // N_PER_THREAD_I32_B),
+                stride=(HEAD_DIM_I32 // N_PER_THREAD_I32_B, 1),
+            )
+            val_layout_load_b = cute.make_layout(
+                (1, N_PER_THREAD_I32_B), stride=(1, 1),
+            )
+            tiled_copy_b = cute.make_tiled_copy_tv(atom_cpb, thr_layout_load_b, val_layout_load_b)
+            thr_copy_b   = tiled_copy_b.get_slice(tidx)
+            tBsB_dst     = thr_copy_b.partition_D(sB_load)
+
+            # ── Persistent loop over indexer requests ──
+            # phase counter only advances when MMA actually fires (when bidx is
+            # within the request's split range). Skipped iters do nothing.
+            phase = cutlass.Int32(0)
             for indexer_request in range(num_idxer_requests):
                 T_idx = smem_indexer_T_idx[indexer_request]
                 req_seq_len = seq_lens[T_idx]
@@ -274,65 +420,98 @@ class Indexer_kvsplit:
                 # has any tokens for this request.
                 request_num_tiles = (req_seq_len + cutlass.Int32(BM - 1)) // cutlass.Int32(BM)
                 if bidx < request_num_tiles:
-                    # ── Per-token flat byte addressing (matches score_scale_simt.py) ──
-                    page_sel      = tidx // cutlass.Int32(PAGE_SIZE)       # 0 or 1
-                    token_in_page = tidx - page_sel * cutlass.Int32(PAGE_SIZE)  # 0..63
-                    page_id = cutlass.Int32(block_table[T_idx, bidx * PAGES_PER_TILE + page_sel])
+                    # ── Per-request page IDs for this tile (bidx) ──
+                    page0_id = cutlass.Int32(block_table[T_idx, bidx * PAGES_PER_TILE + 0])
+                    page1_id = cutlass.Int32(block_table[T_idx, bidx * PAGES_PER_TILE + 1])
+                    page_stride_b   = PAGE_SIZE * ROW_STRIDE
+                    page_stride_i32 = page_stride_b // 4
+                    page0_off_i32   = page0_id * page_stride_i32
+                    jump_i32        = (page1_id - page0_id) * page_stride_i32
 
-                    fp8_byte_off = page_id * cutlass.Int32(PAGE_BYTES) + token_in_page * cutlass.Int32(HEAD_DIM)
-                    a_fp8_ptr = cute.make_ptr(
-                        cutlass.Float8E4M3FN,
-                        (cute.recast_ptr(k_index_cache_fp8.iterator, dtype=cutlass.Float8E4M3FN) + fp8_byte_off).toint(),
-                        mem_space=cute.AddressSpace.gmem, assumed_align=1,
+                    # ── A-load (cp.async i32 view) ──
+                    i32_base = cute.make_ptr(
+                        cutlass.Int32,
+                        (cute.recast_ptr(k_index_cache_fp8.iterator, dtype=cutlass.Int32) + page0_off_i32).toint(),
+                        mem_space=cute.AddressSpace.gmem, assumed_align=4,
                     )
-                    a_row = cute.make_tensor(a_fp8_ptr, cute.make_layout((HEAD_DIM,), stride=(1,)))
-                    a_z   = cute.zipped_divide(a_row, (num_vec,))
+                    gA_i32 = cute.make_tensor(i32_base, cute.make_layout(
+                        ((PAGE_SIZE, PAGES_PER_TILE), HEAD_DIM_I32),
+                        stride=((ROW_STRIDE_I32, jump_i32), 1),
+                    ))
+                    tAgA = thr_copy_a.partition_S(gA_i32)
+                    cute.copy(atom_cpa, tAgA, tAsA)
 
-                    scale_byte_off = page_id * cutlass.Int32(PAGE_BYTES) + cutlass.Int32(FP8_REGION) + token_in_page * cutlass.Int32(4)
-                    scale_f32_off  = scale_byte_off // cutlass.Int32(4)
-                    scale_ptr = cute.make_ptr(
-                        cutlass.Float32,
-                        (cute.recast_ptr(k_index_cache_fp8.iterator, dtype=cutlass.Float32) + scale_f32_off).toint(),
-                        mem_space=cute.AddressSpace.gmem, assumed_align=1,
+                    # ── B-load: q[T_idx, :, :] via 32b cp.async, swizzled sB dest ──
+                    q_req_off_i32 = T_idx * (BN * HEAD_DIM_I32)
+                    gB_i32_ptr = cute.make_ptr(
+                        cutlass.Int32,
+                        (cute.recast_ptr(q_index_fp8.iterator, dtype=cutlass.Int32) + q_req_off_i32).toint(),
+                        mem_space=cute.AddressSpace.gmem, assumed_align=4,
                     )
-                    scale_tensor = cute.make_tensor(scale_ptr, cute.make_layout((1,), stride=(1,)))
-                    scale = scale_tensor[0]
+                    gB_i32 = cute.make_tensor(gB_i32_ptr, cute.make_layout(
+                        (BN, HEAD_DIM_I32), stride=(HEAD_DIM_I32, 1),
+                    ))
+                    tBgB = thr_copy_b.partition_S(gB_i32)
+                    cute.copy(atom_cpb, tBgB, tBsB_dst)
 
-                    # ── Per-request weights into smem ──
-                    if tidx < cutlass.Int32(BN):
+                    # ── Per-tile scales (last 4B of each row in kv_pool) ──
+                    SCALE_ROW_STRIDE_F32 = ROW_STRIDE // 4
+                    page_stride_f32      = PAGE_SIZE * SCALE_ROW_STRIDE_F32
+                    page0_off_f32        = page0_id * page_stride_f32
+                    jump_f32             = (page1_id - page0_id) * page_stride_f32
+                    fp32_base = cute.recast_ptr(k_index_cache_fp8.iterator, dtype=cutlass.Float32) + page0_off_f32
+                    scale_ptr = fp32_base + (HEAD_DIM // 4)
+                    scale_layout = cute.make_layout(((PAGE_SIZE, PAGES_PER_TILE),),
+                                                    stride=((SCALE_ROW_STRIDE_F32, jump_f32),))
+                    gScale = cute.make_tensor(scale_ptr, scale_layout)
+                    if tidx < BM:
+                        sScales[tidx] = gScale[tidx]
+
+                    # ── Per-request weights ──
+                    if tidx < BN:
                         sWeights[tidx] = weights[T_idx, tidx]
+
+                    # ── Sync: cp.async commit + wait + proxy fence ──
+                    cute.arch.cp_async_commit_group()
+                    cute.arch.cp_async_wait_group(0)
                     cute.arch.sync_threads()
+                    cute.arch.fence_view_async_shared()
 
-                    # ── SIMT dot product, weighted sum ──
-                    m_out   = bidx * cutlass.Int32(BM) + tidx
-                    out_val = cutlass.Float32(0)
+                    # ── MMA fire ──
+                    tcgen05_fence()
+                    if warp_idx == 0:
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                        num_k_blocks = cute.size(tCrA, mode=[2])
+                        for k_block_idx in range(num_k_blocks):
+                            k_block_coord = (None, None, k_block_idx, 0)
+                            cute.gemm(tiled_mma, tCtAcc,
+                                      tCrA[k_block_coord], tCrB[k_block_coord], tCtAcc)
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        if tidx == 0:
+                            tcgen05.commit(mma_mbar)
 
-                    if m_out < req_seq_len:
+                    cute.arch.mbarrier_wait(mma_mbar, phase)
+
+                    # ── Epilogue ──
+                    if tidx < self.indexer_threads // 4:   # COMPUTE_THREADS = 128
+                        cute.copy(tmem_tiled_copy, tTR_tAcc[None, None, 0], tTR_rAcc)
+
+                        scale   = sScales[tidx]
+                        out_val = cutlass.Float32(0)
                         for n_idx in cutlass.range_constexpr(BN):
-                            q_off = T_idx * cutlass.Int32(BN * HEAD_DIM) + cutlass.Int32(n_idx * HEAD_DIM)
-                            b_fp8_ptr = cute.make_ptr(
-                                cutlass.Float8E4M3FN,
-                                (cute.recast_ptr(q_index_fp8.iterator, dtype=cutlass.Float8E4M3FN) + q_off).toint(),
-                                mem_space=cute.AddressSpace.gmem, assumed_align=1,
-                            )
-                            b_row = cute.make_tensor(b_fp8_ptr, cute.make_layout((HEAD_DIM,), stride=(1,)))
-                            b_z   = cute.zipped_divide(b_row, (num_vec,))
+                            val      = tTR_rAcc[n_idx] * scale
+                            out_val  = out_val + max(val, cutlass.Float32(0)) * sWeights[n_idx]
 
-                            acc = cutlass.Float32(0)
-                            for k4 in range(k_iters):
-                                a_frag = a_z[(None, (k4,))].load()
-                                b_frag = b_z[(None, (k4,))].load()
-                                a_f32  = a_frag.to(cutlass.Float32)
-                                b_f32  = b_frag.to(cutlass.Float32)
-                                for v in cutlass.range_constexpr(num_vec):
-                                    acc += a_f32[v] * b_f32[v]
-
-                            val     = acc * scale
-                            out_val = out_val + max(val, cutlass.Float32(0)) * sWeights[n_idx]
-
+                        m_out = bidx * BM + tidx
                         score_output[T_idx, m_out] = out_val
 
                     cute.arch.sync_threads()
+                    phase = phase ^ cutlass.Int32(1)
+
+            # ── One-time teardown ──
+            if warp_idx == 0:
+                cute.arch.relinquish_tmem_alloc_permit()
+                cute.arch.dealloc_tmem(tmem_ptr, tmem_alloc_cols)
             
     @cute.kernel
     def topk_kernel(
@@ -472,7 +651,7 @@ class Indexer_kvsplit:
             tie_cursor   = cutlass.Int32(0)
 
             col = cutlass.Int32(0)
-            while col < sl:
+            while col < max_col:
                 cur_col  = col + tidx
                 is_valid = cur_col < sl
 
@@ -540,20 +719,14 @@ class Indexer_kvsplit:
                 if is_b > cutlass.Int32(0):
                     goff = above_cursor + warp_b_off + my_b_excl
                     if goff < above_total:
-                        page_local_b  = cur_col // cutlass.Int32(PAGE_SIZE)
-                        tok_offset_b  = cur_col - page_local_b * cutlass.Int32(PAGE_SIZE)
-                        global_page_b = cutlass.Int32(block_table[bidx, page_local_b])
-                        topk_indices[bidx, goff] = global_page_b * cutlass.Int32(PAGE_SIZE) + tok_offset_b
+                        topk_indices[bidx, goff] = cur_col
 
                 if is_t > cutlass.Int32(0):
                     toff    = tie_cursor + warp_t_off + my_t_excl
                     wrt_pos = above_total + toff
                     if toff < need_ties:
                         if wrt_pos < cutlass.Int32(top_k_len):
-                            page_local_t  = cur_col // cutlass.Int32(PAGE_SIZE)
-                            tok_offset_t  = cur_col - page_local_t * cutlass.Int32(PAGE_SIZE)
-                            global_page_t = cutlass.Int32(block_table[bidx, page_local_t])
-                            topk_indices[bidx, wrt_pos] = global_page_t * cutlass.Int32(PAGE_SIZE) + tok_offset_t
+                            topk_indices[bidx, wrt_pos] = cur_col
 
                 above_round  = smem_above_round[0]
                 tie_round    = smem_tie_round[0]

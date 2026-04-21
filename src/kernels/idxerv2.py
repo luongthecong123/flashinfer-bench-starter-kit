@@ -9,7 +9,7 @@ from cutlass.cutlass_dsl import dsl_user_op, T
 
 TOP_K = 2048
 LIMIT_REQUEST = 32
-LIMIT_SEQ_LEN = 6400
+LIMIT_SEQ_LEN = 320000
 DIM_SPLIT = 128
 PAGE_SIZE = 64
 NUM_HEADS  = 64
