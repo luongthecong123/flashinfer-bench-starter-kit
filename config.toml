@@ -16,4 +16,4 @@ author = "Cong"
 
 [build]
 language = "triton"
-entry_point = "idxerv3.py::run"
+entry_point = "idxerv4_hist_pdl.py::run"
