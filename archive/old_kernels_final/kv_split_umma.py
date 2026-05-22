@@ -139,10 +139,10 @@ class Dsa():
         ).launch(grid=[NUM_HEADS // HEADS_PER_SPLIT, NUM_SPLITS, 1],
                  block=[self.umma_threads + self.sgemm_threads, 1, 1], stream=stream)
 
-        # self.reduce_kernel(
-        #     sparse_indices, partial_out, partial_lse, output, lse,
-        # ).launch(grid=[T, self.num_heads, 1],
-        #          block=[self.reduce_threads, 1, 1], stream=stream, use_pdl=True)
+        self.reduce_kernel(
+            sparse_indices, partial_out, partial_lse, output, lse,
+        ).launch(grid=[T, NUM_HEADS, 1],
+                 block=[self.reduce_threads, 1, 1], stream=stream)
         
     @staticmethod
     def _smem(allocator, dtype, shape, stride, byte_alignment=16, swizzle=None):
@@ -186,6 +186,8 @@ class Dsa():
         # TODO: Might needs swizzle 128b here to avoid bank conflict on 2 heads
         smem_partial_sgemm = self._smem(alloc, cutlass.Float32, (self.num_sgemm_warps, HEADS_PER_SPLIT, DIM_SPLIT),
                            (HEADS_PER_SPLIT * DIM_SPLIT, DIM_SPLIT, 1))
+        # Per-warp intermediate for UMMA cross-warp max/sum reduction (shape: num_umma_warps × HEADS_PER_SPLIT)
+        smem_sm_red_umma = self._smem(alloc, cutlass.Float32, (self.num_umma_warps, HEADS_PER_SPLIT), (HEADS_PER_SPLIT, 1))
         smem_max = self._smem(alloc, cutlass.Float32, (HEADS_PER_SPLIT,), (1,))
         smem_sum = self._smem(alloc, cutlass.Float32, (HEADS_PER_SPLIT,), (1,))
         smem_logits_flat = self._smem(alloc, cutlass.Float32, (HEADS_PER_SPLIT * DIM_SPLIT,), (1,))
@@ -301,7 +303,8 @@ class Dsa():
                 cute.arch.mbarrier_init(umma_mbar, cnt=1)
                 cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
-        num_k_blocks = cute.size(tCrA, mode=[2])     
+        num_k_blocks = cute.size(tCrA, mode=[2])
+        umma_phase = cutlass.Int32(0)
         
         tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc_tmpl.layout)
         
@@ -341,29 +344,35 @@ class Dsa():
                 stride=(0, HEADS_PER_SPLIT * HEAD_DIM_KPE, HEAD_DIM_KPE, 1),
             ),
         )
+        # UMMA query preload: 16 rows (token-major, 2 heads each), matching reference mapping.
+        if warp_idx < self.umma_inst[1]:
+            t_idx_w = warp_idx >> cutlass.Int32(1)
+            h_local_w = warp_idx & cutlass.Int32(1)
+            safe_t = t_idx_w
+            if t_idx_w >= T:
+                safe_t = cutlass.Int32(0)
+
+            head_idx_w = head_base_idx * HEADS_PER_SPLIT + h_local_w
+            sB_row_w = warp_idx
+
+            gB_row = gB_full[None, safe_t, head_idx_w, None]
+            sB_qr_row = sB_qr[None, sB_row_w, None]
+            cute.copy(atom_cpa_ckv, lane_copy_ckv.partition_S(gB_row), lane_copy_ckv.partition_D(sB_qr_row))
+
+            qn_row = q_nope_full[None, safe_t, head_idx_w, None]
+            sB_qn_row = sB_qn[None, sB_row_w, None]
+            cute.copy(atom_cpa_kpe, lane_copy_kpe.partition_S(qn_row), lane_copy_kpe.partition_D(sB_qn_row))
+
+            cute.arch.cp_async_commit_group()
+
+        # SGEMM query preload: only for real tokens.
         if warp_idx < T:
             T_idx = warp_idx
             head_idx0 = head_base_idx * 2
             head_idx1 = head_base_idx * 2 + 1
-            gB_row0   = gB_full[None, T_idx, head_idx0, None]
-            gB_row1   = gB_full[None, T_idx, head_idx1, None]
-            sB_qr_row0 = sB_qr[None, warp_idx * 2, None]
-            sB_qr_row1 = sB_qr[None, warp_idx * 2 + 1, None]
-            smem_qr_row0 = smem_qr_full[None, T_idx, 0, None]
-            smem_qr_row1 = smem_qr_full[None, T_idx, 1, None]
-            cute.copy(atom_cpa_ckv, lane_copy_ckv.partition_S(gB_row0), lane_copy_ckv.partition_D(sB_qr_row0))
-            cute.copy(atom_cpa_ckv, lane_copy_ckv.partition_S(gB_row1), lane_copy_ckv.partition_D(sB_qr_row1))               
+
             cute.copy(atom_cpa_qn_score, lane_copy_qn_score.partition_S(q_nope[T_idx, head_idx0, None]), lane_copy_qn_score.partition_D(smem_qr_sgemm[T_idx, 0, None]))
             cute.copy(atom_cpa_qn_score, lane_copy_qn_score.partition_S(q_nope[T_idx, head_idx1, None]), lane_copy_qn_score.partition_D(smem_qr_sgemm[T_idx, 1, None]))
-            
-            sB_qn_row0 = sB_qn[None, warp_idx * 2, None]
-            sB_qn_row1 = sB_qn[None, warp_idx * 2 + 1, None]
-            smem_qn_row0 = smem_qn_full[None, T_idx, 0, None]
-            smem_qn_row1 = smem_qn_full[None, T_idx, 1, None]
-            qn_row0 = q_nope_full[None, T_idx, head_idx0, None]
-            qn_row1 = q_nope_full[None, T_idx, head_idx1, None]
-            cute.copy(atom_cpa_kpe, lane_copy_kpe.partition_S(qn_row0), lane_copy_kpe.partition_D(sB_qn_row0))
-            cute.copy(atom_cpa_kpe, lane_copy_kpe.partition_S(qn_row1), lane_copy_kpe.partition_D(sB_qn_row1))               
             cute.copy(atom_cpa_qr_score, lane_copy_qr_score.partition_S(q_pe[T_idx, head_idx0, None]), lane_copy_qr_score.partition_D(smem_qn_sgemm[T_idx, 0, None]))
             cute.copy(atom_cpa_qr_score, lane_copy_qr_score.partition_S(q_pe[T_idx, head_idx1, None]), lane_copy_qr_score.partition_D(smem_qn_sgemm[T_idx, 1, None]))
 
@@ -406,21 +415,35 @@ class Dsa():
         smem_logits_flat_ = cute.zipped_divide(smem_logits_flat, (HEADS_PER_SPLIT,))
         smem_score_sgemm_ = cute.zipped_divide(smem_score_sgemm, (1, DIM_SPLIT // self.wsize))
         smem_partial_sgemm_ = cute.zipped_divide(smem_partial_sgemm, (1, 1, self.out_vec))
-        
+
+        # UMMA output GEMV: load 2 bf16 per thread per k-block from smem sA_ckv
+        atom_s2r = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.ab_dtype, num_bits_per_copy=32)
+        OUT_VEC_PER_KO:  cutlass.Constexpr = 2
+        N_KO_PER_STAGE:  cutlass.Constexpr = (HEAD_DIM_CKV // self.k_tile) // self.out_stages  # = 2
+        OUT_VEC_TOTAL_UMMA: cutlass.Constexpr = OUT_VEC_PER_KO * N_KO_PER_STAGE               # = 4
+        thr_layout_out = cute.make_layout((32,), stride=(1,))
+        val_layout_out = cute.make_layout((OUT_VEC_PER_KO,), stride=(1,))
+        tiled_copy_out = cute.make_tiled_copy_tv(atom_s2r, thr_layout_out, val_layout_out)
+        lane_copy_out  = tiled_copy_out.get_slice(lane_idx)
+
         # 3. Warp specialization: 
         # First 256 threads -> UMMA on num_valid = 128
         # Last 512 threads -> SGEMM on 0 < num_valid < 128
         
         # UMMA workers
         if warp_idx < self.num_umma_warps:
-            for T_idx in range(T):
-                split_idx_new = smem_assign[T_idx, 0]
-                num_valid = smem_assign[T_idx, 1]
-                if num_valid == DIM_SPLIT:
-                    # Load sA (ckv+kpe = 128x576 bf16), each warp loads 1 row
-                    num_rounds = DIM_SPLIT // self.num_umma_warps
-                    
-                 
+            umma_warp_idx = warp_idx   # 0..num_umma_warps-1
+            umma_tidx     = tidx       # 0..umma_threads-1
+
+            for T_idx in cutlass.range_constexpr(LIMIT_REQUEST):
+                if T_idx < T:
+                    split_idx_new = smem_assign[T_idx, 0]
+                    num_valid     = smem_assign[T_idx, 1]
+                    if num_valid == DIM_SPLIT:
+                        # ── Load sA: each warp loads (DIM_SPLIT // num_umma_warps) rows ──
+                        num_rounds_load: cutlass.Constexpr = DIM_SPLIT // self.num_umma_warps  # 16
+
+
         # SGEMM workers
         else:
             warp_idx_sgemm = warp_idx - self.num_umma_warps
@@ -517,11 +540,8 @@ class Dsa():
                         if lane_idx == 0:
                             head_base_idx, split_idx_old, _ = cute.arch.block_idx()
                             head_idx_global = head_base_idx * 2 + warp_idx_sgemm
-                            if split_idx_new == 0:
-                                lse[T_idx, head_idx_global] = (row_max + cute.math.log(row_sum)) / cutlass.Float32(LN2)
-                            else:
-                                partial_lse[T_idx, split_idx_new, head_idx_global, 0] = row_max
-                                partial_lse[T_idx, split_idx_new, head_idx_global, 1] = row_sum
+                            partial_lse[T_idx, split_idx_new, head_idx_global, 0] = row_max
+                            partial_lse[T_idx, split_idx_new, head_idx_global, 1] = row_sum
                     
                     cute.arch.barrier(barrier_id=self.sgemm_bar_id, 
                                       number_of_threads=self.sgemm_threads)
@@ -582,11 +602,7 @@ class Dsa():
                                 final_sum += smem_partial_sgemm[i, thr_group_idx, thr_group_lane]
 
                             # Store results to gmem
-                            if split_idx_new == 0:
-                                final_sum /= smem_sum[thr_group_idx]
-                                output[T_idx, head_idx_global, out_col] = cutlass.BFloat16(final_sum)
-                            else:
-                                partial_out[T_idx, split_idx_new, head_idx_global, out_col] = final_sum
+                            partial_out[T_idx, split_idx_new, head_idx_global, out_col] = final_sum
                                 
                         cute.arch.barrier(barrier_id=self.sgemm_bar_id, 
                                         number_of_threads=self.sgemm_threads)
@@ -598,6 +614,105 @@ class Dsa():
         cute.arch.sync_threads()
         if warp_idx == 0:
             cute.arch.dealloc_tmem(tmem_ptr, tmem_alloc_cols)
+
+    @cute.kernel
+    def reduce_kernel(
+        self,
+        sparse_indices: cute.Tensor,
+        partial_out:    cute.Tensor,
+        partial_lse:    cute.Tensor,
+        output:         cute.Tensor,
+        lse:            cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane_idx = cute.arch.lane_idx()
+        T_idx, head_idx, _ = cute.arch.block_idx()
+
+        # Count valid indices for this token to determine active split count.
+        alloc = cutlass.utils.SmemAllocator()
+        smem_red_i32 = self._smem(alloc, cutlass.Int32, (32,), (1,))
+        smem_reduce_f32 = self._smem(alloc, cutlass.Float32, (2,), (1,))
+
+        partial_cnt = cutlass.Int32(0)
+        for i in range(tidx, TOP_K, self.reduce_threads):
+            idx = sparse_indices[T_idx, i]
+            if idx >= cutlass.Int32(0):
+                partial_cnt += cutlass.Int32(1)
+
+        cnt_sum = warp_reduce(partial_cnt, lambda a, b: a + b)
+        if lane_idx == 0:
+            smem_red_i32[warp_idx] = cnt_sum
+        cute.arch.sync_threads()
+
+        if warp_idx == 0:
+            val = cutlass.Int32(0)
+            if lane_idx < self.reduce_warps:
+                val = smem_red_i32[lane_idx]
+            val = warp_reduce(val, lambda a, b: a + b, width=self.reduce_warps)
+            if lane_idx == 0:
+                smem_red_i32[0] = val
+        cute.arch.sync_threads()
+
+        num_valid = smem_red_i32[0]
+        if num_valid <= 0:
+            if tidx < HEAD_DIM_CKV:
+                output[T_idx, head_idx, tidx] = cutlass.BFloat16(0)
+            if tidx == 0:
+                lse[T_idx, head_idx] = -cutlass.Float32(math.inf)
+        else:
+            if tidx == 0:
+                # Exact active-split detection from sparse indices to avoid
+                # assumptions about contiguous split occupancy.
+                for s in range(NUM_SPLITS):
+                    cnt = cutlass.Int32(0)
+                    base = s * DIM_SPLIT
+                    for i in range(DIM_SPLIT):
+                        if sparse_indices[T_idx, base + i] >= cutlass.Int32(0):
+                            cnt += cutlass.Int32(1)
+                    smem_red_i32[s] = cnt
+
+                g_max = -cutlass.Float32(math.inf)
+                for s in range(NUM_SPLITS):
+                    if smem_red_i32[s] > cutlass.Int32(0):
+                        local_max = partial_lse[T_idx, s, head_idx, 0]
+                        if local_max > g_max:
+                            g_max = local_max
+
+                g_lse_sum = cutlass.Float32(0)
+                for s in range(NUM_SPLITS):
+                    if smem_red_i32[s] > cutlass.Int32(0):
+                        l_max = partial_lse[T_idx, s, head_idx, 0]
+                        l_sum = partial_lse[T_idx, s, head_idx, 1]
+                        g_lse_sum += l_sum * cute.math.exp(l_max - g_max)
+
+                smem_reduce_f32[0] = g_max
+                smem_reduce_f32[1] = g_lse_sum
+                lse[T_idx, head_idx] = (g_max + cute.math.log(g_lse_sum)) / cutlass.Float32(LN2)
+
+            cute.arch.sync_threads()
+
+            g_max = smem_reduce_f32[0]
+            g_lse_sum = smem_reduce_f32[1]
+
+            partial_out_v = cute.zipped_divide(partial_out, (1, 1, 1, self.vec_reduce))
+            output_v = cute.zipped_divide(output, (1, 1, self.vec_reduce))
+
+            if tidx < (HEAD_DIM_CKV // self.vec_reduce):
+                acc_rmem = cute.make_rmem_tensor(cute.make_layout((self.vec_reduce,), stride=(1,)), cutlass.Float32)
+                acc_rmem[0] = cutlass.Float32(0)
+                acc_rmem[1] = cutlass.Float32(0)
+                acc = acc_rmem.load()
+
+                for s in range(NUM_SPLITS):
+                    if smem_red_i32[s] > cutlass.Int32(0):
+                        l_max = partial_lse[T_idx, s, head_idx, 0]
+                        scale = cute.math.exp(l_max - g_max)
+                        p = partial_out_v[(0, 0, 0, None), (T_idx, s, head_idx, tidx)].load()
+                        acc = acc + scale * p
+
+                out_val = acc / g_lse_sum
+                output_v[(0, 0, None), (T_idx, head_idx, tidx)].store(out_val.to(cutlass.BFloat16))
                                                                         
                             
                             
@@ -636,5 +751,8 @@ _hybrid, _compiled = compile_hybrid()
 
 
 def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, lse):
+    _hybrid.partial_out.zero_()
+    _hybrid.partial_lse[:, :, :, 0].fill_(-float("inf"))
+    _hybrid.partial_lse[:, :, :, 1].zero_()
     _compiled(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices,
               _hybrid.partial_out, _hybrid.partial_lse, output, lse)    

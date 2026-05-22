@@ -158,6 +158,15 @@ def main():
             if not ok:
                 all_pass = False
             line += f" {miss_frac:>10.4f} {'PASS' if ok else 'FAIL':>6}"
+            long_reqs = (seq_lens > TOPK).nonzero(as_tuple=True)[0].tolist()
+            if long_reqs:
+                torch.set_printoptions(threshold=10_000, linewidth=200)
+                for b in long_reqs:
+                    sl = int(seq_lens[b].item())
+                    print(f"\n--- req {b} (seq_len={sl} > TOPK={TOPK}) ref_topk ---")
+                    print(ref_topk[b].cpu())
+                    print(f"--- req {b} (seq_len={sl} > TOPK={TOPK}) impl_topk ---")
+                    print(impl_topk[b].cpu())
             if not ok:
                 print(line)
                 continue

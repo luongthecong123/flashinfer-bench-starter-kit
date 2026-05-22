@@ -1,0 +1,322 @@
+"""kv_split_umma_v3_stages_pe_prologue.py
+
+Step 1 of the kv_split_umma_v3_stages family.
+
+This isolates the *PE prologue* of the eventual full kernel:
+
+  - 1 CTA, 512 threads (16 warps).
+  - Single shared sA(128,512) bf16 + sB(8,512) bf16 — same byte layout as the
+    full kernel (8 K-panels of 64 elems each).
+  - The 8 PE tokens are packed into the K dimension: PE-slot i lives at
+    panel i (offset i * MMA_M * MMA_K_PACKED in sA, i * MMA_N * MMA_K_PACKED
+    in sB). No dedicated PE smem allocation.
+  - All 8 PE GEMMs are independent (no inter-token dependency). The producer
+    issues every cp.async, then a single fence + barrier, then warp 0 fires
+    8 UMMAs writing to 8 separate per-token tmem slots.
+  - Validation: dump tmem to gmem and compare to the analytical
+        out[i, h, c] = sum_k q_pe[i, h, k] * kpe_flat[sp[i, c], k]
+"""
+
+import math
+import torch
+import cutlass
+import cutlass.cute as cute
+import cutlass.utils as utils
+from cutlass._mlir.dialects import llvm
+from cutlass.cute.nvgpu import tcgen05, cpasync
+from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+
+# ── constants ─────────────────────────────────────────────────────────────────
+T               = 8                                          # tokens / PE slots
+HEADS_PER_SPLIT = 2
+HEAD_DIM_KPE    = 64
+DIM_SPLIT       = 128
+
+NUM_WARPS   = 16
+NUM_THREADS = NUM_WARPS * 32                                 # 512
+
+NUM_PAGES  = 8462
+PAGE_SIZE  = 64
+FLAT_CACHE = NUM_PAGES * PAGE_SIZE
+
+UMMA_INST = (DIM_SPLIT, 8, 16)
+MMA_M, MMA_N, MMA_K = UMMA_INST
+TMEM_COLS_PER_TOKEN = MMA_N                                  # 8
+MMA_K_PACK   = 4
+MMA_K_PACKED = MMA_K * MMA_K_PACK                            # 64
+# 8 K-panels — one per PE token. Same shape/byte budget as the parent kernel's
+# 9-panel sA/sB (we just don't use the 9th).
+MMA_K_TILES_FULL = T                                         # 8
+
+PROD_BAR_ID = 1
+
+
+@dsl_user_op
+def tcgen05_fence(*, loc=None, ip=None):
+    llvm.inline_asm(
+        None, [], "tcgen05.fence::after_thread_sync;", "",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+
+
+def _panel_copy_layout(num_rows: int, k_packed: int, k_tiles: int):
+    return cute.make_layout(
+        (num_rows, (k_packed, k_tiles)),
+        stride=(k_packed, (1, num_rows * k_packed)),
+    )
+
+
+# ── kernel ────────────────────────────────────────────────────────────────────
+
+class TestPePrologue:
+
+    @cute.jit
+    def __call__(self, q_pe, kpe_flat, sparse_indices, output, stream):
+        op = tcgen05.MmaF16BF16Op(
+            cutlass.BFloat16, cutlass.Float32, UMMA_INST,
+            tcgen05.CtaGroup.ONE, tcgen05.OperandSource.SMEM,
+            tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.K,
+        )
+        tiled_mma = cute.make_tiled_mma(op)
+
+        @cute.struct
+        class SharedStorage:
+            mma_mbars:        cute.struct.MemRange[cutlass.Int64, T]
+            tmem_holding_buf: cutlass.Int32
+        self.shared_storage = SharedStorage
+
+        self._kernel(
+            tiled_mma, q_pe, kpe_flat, sparse_indices, output,
+        ).launch(grid=[1, 1, 1], block=[NUM_THREADS, 1, 1], stream=stream)
+
+    @cute.kernel
+    def _kernel(
+        self,
+        tiled_mma,
+        q_pe:           cute.Tensor,
+        kpe_flat:       cute.Tensor,
+        sparse_indices: cute.Tensor,
+        output:         cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane_idx = cute.arch.lane_idx()
+
+        # ── smem allocation ───────────────────────────────────────────────────
+        alloc = cutlass.utils.SmemAllocator()
+        storage = alloc.allocate(self.shared_storage)
+        mbar_base = storage.mma_mbars.data_ptr()
+
+        swizzle = cute.make_swizzle(3, 4, 3)
+
+        # 8-panel sA (128 × 512 bf16) and sB (8 × 512 bf16). Each panel is one
+        # PE slot; panel i has K=64 columns starting at offset
+        # i * MMA_M * MMA_K_PACKED (sA) / i * MMA_N * MMA_K_PACKED (sB).
+        a_outer = cute.make_layout(
+            ((MMA_M, MMA_K), 1, (MMA_K_PACK, MMA_K_TILES_FULL)),
+            stride=((MMA_K_PACKED, 1), 0, (MMA_K, MMA_M * MMA_K_PACKED)),
+        )
+        b_outer = cute.make_layout(
+            ((MMA_N, MMA_K), 1, (MMA_K_PACK, MMA_K_TILES_FULL)),
+            stride=((MMA_K_PACKED, 1), 0, (MMA_K, MMA_N * MMA_K_PACKED)),
+        )
+        sA = alloc.allocate_tensor(cutlass.BFloat16, a_outer, byte_alignment=16, swizzle=swizzle)
+        sB = alloc.allocate_tensor(cutlass.BFloat16, b_outer, byte_alignment=16, swizzle=swizzle)
+
+        smem_sp_indices = alloc.allocate_tensor(
+            cutlass.Int32,
+            cute.make_layout((T, DIM_SPLIT), stride=(DIM_SPLIT, 1)),
+            4,
+        )
+
+        # PE copy: 64 bf16 per row = 32 threads × 2 bf16 (32-bit copies).
+        atom_cpa_pe = cute.make_copy_atom(cpasync.CopyG2SOp(), cutlass.BFloat16, num_bits_per_copy=32)
+        thr_layout    = cute.make_layout(((8, 4),), stride=((1, 8),))
+        val_layout_pe = cute.make_layout(((2, 1),), stride=((1, 0),))
+        tiled_copy_pe = cute.make_tiled_copy_tv(atom_cpa_pe, thr_layout, val_layout_pe)
+        lane_copy_pe  = tiled_copy_pe.get_slice(lane_idx)
+
+        k_split_shape_pe = cute.make_layout(((MMA_K_PACKED, 1),))
+
+        # Per-panel copy views over sA / sB.
+        panel_stride_A: cutlass.Constexpr = MMA_M * MMA_K_PACKED
+        panel_stride_B: cutlass.Constexpr = MMA_N * MMA_K_PACKED
+
+        # ── tmem alloc + mbar init ────────────────────────────────────────────
+        tCrA = tiled_mma.make_fragment_A(sA)
+        tCrB = tiled_mma.make_fragment_B(sB)
+
+        acc_shape       = tiled_mma.partition_shape_C((MMA_M, MMA_N))
+        tCtAcc_tmpl     = tiled_mma.make_fragment_C(acc_shape)
+        per_token_cols  = utils.get_num_tmem_alloc_cols(tCtAcc_tmpl)
+        tmem_alloc_cols = cutlass.Int32(per_token_cols * T)
+
+        # Stage sparse_indices into smem (T*DIM_SPLIT = 1024 i32 = 2 rounds @ 512 thr).
+        for k in range(2):
+            flat_idx = k * NUM_THREADS + tidx
+            row = flat_idx // DIM_SPLIT
+            col = flat_idx %  DIM_SPLIT
+            if row < T:
+                smem_sp_indices[row, col] = sparse_indices[row, col]
+
+        if warp_idx == 0:
+            cute.arch.alloc_tmem(tmem_alloc_cols, storage.tmem_holding_buf)
+            if tidx == 0:
+                for i in range(T):
+                    cute.arch.mbarrier_init(mbar_base + i, cnt=1)
+                cute.arch.mbarrier_init_fence()
+        cute.arch.sync_threads()
+
+        tmem_ptr = cute.arch.retrieve_tmem_ptr(
+            cutlass.Float32, alignment=16,
+            ptr_to_buffer_holding_addr=storage.tmem_holding_buf,
+        )
+
+        # ── tmem → rmem epilogue plumbing for the dump ────────────────────────
+        tCtAcc_base     = cute.make_tensor(tmem_ptr, tCtAcc_tmpl.layout)
+        M_acc           = cute.size(tCtAcc_base, mode=[0, 0])
+        ld_op           = tcgen05.Ld32x32bOp(tcgen05.Repetition(HEADS_PER_SPLIT))
+        epi_tiler       = ((M_acc, HEADS_PER_SPLIT),)
+        tCtAcc_epi_base = cute.zipped_divide(tCtAcc_base, epi_tiler)
+        copy_atom_t2r   = cute.make_copy_atom(ld_op, cutlass.Float32)
+        tmem_tiled_copy = tcgen05.make_tmem_copy(copy_atom_t2r, tCtAcc_epi_base[None, 0])
+        tmem_thr_copy   = tmem_tiled_copy.get_slice(tidx)
+        tTR_tAcc_base   = tmem_thr_copy.partition_S(tCtAcc_epi_base)
+        tTR_rAcc        = cute.make_rmem_tensor(tTR_tAcc_base[None, None, 0].shape, cutlass.Float32)
+
+        # ════════════════════════════════════════════════════════════════════
+        # Cooperative PE prologue (all 16 warps)
+        # ════════════════════════════════════════════════════════════════════
+        # Each warp owns 128/16 = 8 kpe rows for *every* token.
+        rows_per_warp: cutlass.Constexpr = MMA_M // NUM_WARPS  # 8
+
+        for i in cutlass.range_constexpr(T):
+            sA_pe_i = cute.make_tensor(
+                sA.iterator + i * panel_stride_A,
+                _panel_copy_layout(MMA_M, MMA_K_PACKED, 1),
+            )
+            sB_pe_i = cute.make_tensor(
+                sB.iterator + i * panel_stride_B,
+                _panel_copy_layout(MMA_N, MMA_K_PACKED, 1),
+            )
+
+            # q_pe[i, head, :] → sB[panel=i][head, :]   (warps 0..1 only)
+            if warp_idx < HEADS_PER_SPLIT:
+                cute.copy(atom_cpa_pe,
+                          lane_copy_pe.partition_S(cute.composition(q_pe[i, warp_idx, None], k_split_shape_pe)),
+                          lane_copy_pe.partition_D(sB_pe_i[warp_idx, None]))
+
+            # kpe_flat[sp[i, row], :] → sA[panel=i][row, :]   (all 16 warps cooperate)
+            for r in range(rows_per_warp):
+                row_idx  = r * NUM_WARPS + warp_idx
+                flat_row = smem_sp_indices[i, row_idx]
+                cute.copy(atom_cpa_pe,
+                          lane_copy_pe.partition_S(cute.composition(kpe_flat[flat_row, None], k_split_shape_pe)),
+                          lane_copy_pe.partition_D(sA_pe_i[row_idx, None]))
+
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.fence_view_async_shared()
+        cute.arch.barrier(barrier_id=PROD_BAR_ID, number_of_threads=NUM_THREADS)
+
+        # 8 independent UMMAs — one per panel/token, each into its own tmem slot.
+        tcgen05_fence()
+        if warp_idx == 0:
+            for i in cutlass.range_constexpr(T):
+                tCtAcc_i = cute.make_tensor(
+                    tmem_ptr + cutlass.Int32(i * TMEM_COLS_PER_TOKEN),
+                    tCtAcc_tmpl.layout,
+                )
+                tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                for kb in range(MMA_K_PACK):
+                    k_flat = i * MMA_K_PACK + kb     # panel i, pack kb
+                    coord  = (None, None, k_flat)
+                    cute.gemm(tiled_mma, tCtAcc_i,
+                              tCrA[coord], tCrB[coord], tCtAcc_i)
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                if lane_idx == 0:
+                    tcgen05.commit(mbar_base + i)
+
+        # Wait for every UMMA to retire.
+        for i in cutlass.range_constexpr(T):
+            cute.arch.mbarrier_wait(mbar_base + i, cutlass.Int32(0))
+
+        # ── tmem → gmem dump (validation hook) ────────────────────────────────
+        for i in cutlass.range_constexpr(T):
+            tTR_tAcc_i = cute.make_tensor(
+                tTR_tAcc_base.iterator + cutlass.Int32(i * TMEM_COLS_PER_TOKEN),
+                tTR_tAcc_base.layout,
+            )
+            if tidx < DIM_SPLIT:
+                cute.copy(tmem_tiled_copy, tTR_tAcc_i[None, None, 0], tTR_rAcc)
+                output[i, 0, tidx] = tTR_rAcc[0]
+                output[i, 1, tidx] = tTR_rAcc[1]
+
+        cute.arch.sync_threads()
+        if warp_idx == 0:
+            cute.arch.relinquish_tmem_alloc_permit()
+        cute.arch.sync_threads()
+        if warp_idx == 0:
+            cute.arch.dealloc_tmem(tmem_ptr, tmem_alloc_cols)
+
+
+# ── compile ───────────────────────────────────────────────────────────────────
+
+def _fake(dtype, shape, stride_order, align=16):
+    return make_fake_compact_tensor(
+        dtype=dtype, shape=shape, stride_order=stride_order, assumed_align=align,
+    )
+
+
+def compile_test():
+    q_pe           = _fake(cute.BFloat16, (T, HEADS_PER_SPLIT, HEAD_DIM_KPE), (2, 1, 0))
+    kpe_flat       = _fake(cute.BFloat16, (FLAT_CACHE, HEAD_DIM_KPE), (1, 0))
+    sparse_indices = _fake(cute.Int32,    (T, DIM_SPLIT), (1, 0), align=4)
+    output         = _fake(cute.Float32,  (T, HEADS_PER_SPLIT, DIM_SPLIT), (2, 1, 0))
+    stream         = make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    test = TestPePrologue()
+    compiled = cute.compile(
+        test, q_pe, kpe_flat, sparse_indices, output, stream,
+        options="--enable-tvm-ffi",
+    )
+    return test, compiled
+
+
+_test, _compiled = compile_test()
+
+
+# ── run + correctness check ───────────────────────────────────────────────────
+
+def run():
+    torch.manual_seed(0)
+
+    q_pe           = torch.randn(T, HEADS_PER_SPLIT, HEAD_DIM_KPE, dtype=torch.bfloat16, device="cuda")
+    kpe_flat       = torch.randn(FLAT_CACHE, HEAD_DIM_KPE,         dtype=torch.bfloat16, device="cuda")
+    sparse_indices = torch.randint(0, FLAT_CACHE, (T, DIM_SPLIT),  dtype=torch.int32,   device="cuda")
+    output         = torch.zeros(T, HEADS_PER_SPLIT, DIM_SPLIT,    dtype=torch.float32, device="cuda")
+
+    _compiled(q_pe, kpe_flat, sparse_indices, output)
+    torch.cuda.synchronize()
+
+    idx = sparse_indices.long()
+    ref = torch.empty_like(output)
+    for t in range(T):
+        gkp = kpe_flat[idx[t], :].float()                          # (DIM_SPLIT, 64)
+        ref[t] = q_pe[t].float() @ gkp.T                           # (H, DIM_SPLIT)
+
+    diff = (output.cpu() - ref.cpu()).abs()
+    print(f"max_abs_err = {diff.max().item():.6f}   mean_abs_err = {diff.mean().item():.6f}")
+    for t in range(T):
+        td = (output[t].cpu() - ref[t].cpu()).abs().max().item()
+        print(f"  token {t}: max_abs_err = {td:.6f}")
+
+    ok = diff.max().item() < 5e-2
+    print(f"PASS={ok}")
+    return ok
+
+
+if __name__ == "__main__":
+    run()

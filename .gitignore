@@ -5,7 +5,7 @@ solution.json
 .vscode/
 .idea/
 .github/
-archive/
+archive/profiling/
 reports/
 profiling/
 images/

@@ -1,0 +1,62 @@
+{
+  "5": {
+    "bucket_count": 32,
+    "requests": 1,
+    "miss_max": 0.0146484375,
+    "miss_mean": 0.0146484375,
+    "miss_p99": 0.0146484375,
+    "overshoot_max": 30.0,
+    "overshoot_mean": 30.0,
+    "pass_1pct": 0
+  },
+  "6": {
+    "bucket_count": 64,
+    "requests": 1,
+    "miss_max": 0.0048828125,
+    "miss_mean": 0.0048828125,
+    "miss_p99": 0.0048828125,
+    "overshoot_max": 10.0,
+    "overshoot_mean": 10.0,
+    "pass_1pct": 1
+  },
+  "7": {
+    "bucket_count": 128,
+    "requests": 1,
+    "miss_max": 0.0048828125,
+    "miss_mean": 0.0048828125,
+    "miss_p99": 0.0048828125,
+    "overshoot_max": 10.0,
+    "overshoot_mean": 10.0,
+    "pass_1pct": 1
+  },
+  "8": {
+    "bucket_count": 256,
+    "requests": 1,
+    "miss_max": 0.00048828125,
+    "miss_mean": 0.00048828125,
+    "miss_p99": 0.00048828125,
+    "overshoot_max": 1.0,
+    "overshoot_mean": 1.0,
+    "pass_1pct": 1
+  },
+  "10": {
+    "bucket_count": 1024,
+    "requests": 1,
+    "miss_max": 0.00048828125,
+    "miss_mean": 0.00048828125,
+    "miss_p99": 0.00048828125,
+    "overshoot_max": 1.0,
+    "overshoot_mean": 1.0,
+    "pass_1pct": 1
+  },
+  "12": {
+    "bucket_count": 4096,
+    "requests": 1,
+    "miss_max": 0.00048828125,
+    "miss_mean": 0.00048828125,
+    "miss_p99": 0.00048828125,
+    "overshoot_max": 1.0,
+    "overshoot_mean": 1.0,
+    "pass_1pct": 1
+  }
+}

@@ -1,0 +1,720 @@
+"""kv_split_umma_v6.py
+
+v6: scale up UMMA pool to 512 threads (1024 total / block).
+- UMMA = 512 threads = 16 warps:
+    * Consumer = warps 0..11 (384 t, MUST be first for tmem ld 128-row alignment).
+      Score / softmax / output GEMV. K read from gmem (L2) — sA freed for next token.
+    * Producer = warps 12..15 (128 t). Loads Q+K via cp.async, issues tcgen05 MMA
+      from warp 12 lane 0; tcgen05.commit signals per-token mma_full mbar.
+      Producer registers manually reduced to 32 (rest of the SM register file
+      balances automatically toward consumer/SGEMM).
+- SGEMM = 512 threads (16 warps), unchanged from v5.
+- Per-request TMEM slot pre-allocation (LIMIT_REQUEST × 8 cols = 64) — same
+  decoupling pattern as v5: producer never blocks on consumer.
+- Total block = 512 + 512 = 1024 threads.
+"""
+import cutlass
+import cutlass.cute as cute
+import cutlass.cute.nvgpu.cpasync as cpasync
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+import cutlass.utils as utils
+import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass.cute.nvgpu import tcgen05, cpasync
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import dsl_user_op, T as MLIR_T
+import math
+import torch
+
+NUM_HEADS = 16
+HEAD_DIM_CKV = 512
+HEAD_DIM_KPE = 64
+TOP_K = 2048
+NUM_PAGES = 8462
+PAGE_SIZE = 64
+FLAT_CACHE = NUM_PAGES * PAGE_SIZE
+LN2 = 0.6931471805599453
+SM_SCALE: cutlass.Constexpr = 0.1352337788608801
+LIMIT_REQUEST = 8
+assert LIMIT_REQUEST <= 8
+DIM_CHUNK = 8
+NUM_SPLITS = 16
+DIM_SPLIT = (TOP_K + NUM_SPLITS - 1) // NUM_SPLITS  # 128
+HEADS_PER_SPLIT = 2
+
+
+@dsl_user_op
+def tcgen05_fence(*, loc=None, ip=None):
+    llvm.inline_asm(
+        None, [], "tcgen05.fence::after_thread_sync;", "",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+
+
+@cute.jit
+def _panel_copy_layout(num_rows: int, k_packed: int, k_tiles: int):
+    return cute.make_layout((num_rows, (k_packed, k_tiles)),
+                            stride=(k_packed, (1, num_rows * k_packed)))
+
+
+@cute.jit
+def warp_reduce(val: cute.Numeric, op: callable, width: cutlass.Constexpr = 32) -> cute.Numeric:
+    for i in range(int(math.log2(width))):
+        val = op(val, cute.arch.shuffle_sync_bfly(val, offset=1 << i))
+    return val
+
+
+class Dsa():
+    def __init__(self):
+        self.wsize = cute.arch.WARP_SIZE
+
+        self.swz_rot_shift = 7
+        self.sp_vec_size_i32 = 4
+        self.out_stages = 4
+        self.out_vec = HEAD_DIM_CKV // (self.out_stages * self.wsize)  # 4
+
+        # ── UMMA workers (full splits) ──
+        # 384 cons + 128 prod = 512 threads (16 warps)
+        self.num_cons_warps = 12
+        self.num_prod_warps = 4
+        self.cons_threads   = self.num_cons_warps * self.wsize  # 384
+        self.prod_threads   = self.num_prod_warps * self.wsize  # 128
+        self.umma_threads   = self.cons_threads + self.prod_threads  # 512
+        self.num_umma_warps = self.umma_threads // self.wsize  # 16
+        self.umma_inst = (DIM_SPLIT, 8, 16)
+        self.tmem_cols_per_token = self.umma_inst[1]  # 8
+        self.tmem_ld_rep = HEADS_PER_SPLIT
+        self.ab_dtype  = cutlass.BFloat16
+        self.acc_dtype = cutlass.Float32
+        self.cons_bar_id = 2
+        self.prod_bar_id = 4
+
+        # Register reallocation: shrink producer to free regs for cons + sgemm.
+        # Multiple of 8, valid 24..256. 32 is the lower practical bound.
+        self.num_regs_producer = 32
+
+        # ── SGEMM workers (partial splits) ──
+        self.sgemm_threads = 512
+        self.num_sgemm_warps = self.sgemm_threads // self.wsize   # 16
+        self.sgemm_ckv_vec = 4
+        self.sgemm_kpe_vec = 2
+        self.sgemm_bar_id = 3
+
+        # ── Reduce kernel ──
+        self.reduce_threads = 256
+        self.reduce_warps = self.reduce_threads // self.wsize
+        self.vec_reduce = 2
+
+        self.partial_out = torch.empty(LIMIT_REQUEST, NUM_SPLITS, NUM_HEADS, HEAD_DIM_CKV, dtype=torch.float32, device="cuda")
+        self.partial_lse = torch.empty(LIMIT_REQUEST, NUM_SPLITS, NUM_HEADS, 2,            dtype=torch.float32, device="cuda")
+
+    @cute.jit
+    def __call__(
+        self,
+        q_nope:         cute.Tensor,
+        q_pe:           cute.Tensor,
+        ckv_cache:      cute.Tensor,
+        kpe_cache:      cute.Tensor,
+        sparse_indices: cute.Tensor,
+        sm_scale:       cutlass.Constexpr,
+        partial_out:    cute.Tensor,
+        partial_lse:    cute.Tensor,
+        output:         cute.Tensor,
+        lse:            cute.Tensor,
+        stream,
+    ):
+        T, _, _ = q_nope.shape
+        ckv_flat = cute.make_tensor(ckv_cache.iterator,
+            cute.make_layout((FLAT_CACHE, HEAD_DIM_CKV), stride=(HEAD_DIM_CKV, 1)))
+        kpe_flat = cute.make_tensor(kpe_cache.iterator,
+            cute.make_layout((FLAT_CACHE, HEAD_DIM_KPE), stride=(HEAD_DIM_KPE, 1)))
+
+        op = tcgen05.MmaF16BF16Op(
+            self.ab_dtype, self.acc_dtype, self.umma_inst,
+            tcgen05.CtaGroup.ONE, tcgen05.OperandSource.SMEM,
+            tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.K,
+        )
+        tiled_mma = cute.make_tiled_mma(op)
+
+        @cute.struct
+        class SharedStorage:
+            mma_full_mbars:   cute.struct.MemRange[cutlass.Int64, LIMIT_REQUEST]
+            tmem_holding_buf: cutlass.Int32
+        self.shared_storage = SharedStorage
+
+        self.compute_kernel(
+            tiled_mma,
+            q_nope, q_pe, ckv_flat, kpe_flat, sparse_indices, sm_scale,
+            partial_out, partial_lse, output, lse,
+        ).launch(grid=[NUM_HEADS // HEADS_PER_SPLIT, NUM_SPLITS, 1],
+                 block=[self.umma_threads + self.sgemm_threads, 1, 1], stream=stream)
+
+        self.reduce_kernel(
+            sparse_indices, partial_out, partial_lse, output, lse,
+        ).launch(grid=[T, NUM_HEADS, 1],
+                 block=[self.reduce_threads, 1, 1], stream=stream)
+
+    @staticmethod
+    def _smem(allocator, dtype, shape, stride, byte_alignment=16, swizzle=None):
+        return allocator.allocate_tensor(dtype, cute.make_layout(shape, stride=stride), byte_alignment, swizzle)
+
+    @cute.kernel
+    def compute_kernel(
+        self,
+        tiled_mma,
+        q_nope:         cute.Tensor,
+        q_pe:           cute.Tensor,
+        ckv_flat:       cute.Tensor,
+        kpe_flat:       cute.Tensor,
+        sparse_indices: cute.Tensor,
+        sm_scale:       cutlass.Constexpr,
+        partial_out:    cute.Tensor,
+        partial_lse:    cute.Tensor,
+        output:         cute.Tensor,
+        lse:            cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        warp_idx   = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane_idx   = cute.arch.lane_idx()
+
+        # ========= SMEM setup =========
+        alloc = cutlass.utils.SmemAllocator()
+
+        smem_sp_indices = self._smem(alloc, cutlass.Int32,   (DIM_CHUNK, DIM_SPLIT), (DIM_SPLIT, 1))
+        smem_assign     = self._smem(alloc, cutlass.Int32,   (DIM_CHUNK, 2),         (2, 1))
+        smem_score        = self._smem(alloc, cutlass.Float32, (HEADS_PER_SPLIT, DIM_SPLIT), (DIM_SPLIT, 1))
+        smem_score_sgemm  = self._smem(alloc, cutlass.Float32, (HEADS_PER_SPLIT, DIM_SPLIT), (DIM_SPLIT, 1))
+        smem_logits_flat       = self._smem(alloc, cutlass.Float32, (HEADS_PER_SPLIT * DIM_SPLIT,), (1,))
+        smem_logits_flat_sgemm = self._smem(alloc, cutlass.Float32, (HEADS_PER_SPLIT * DIM_SPLIT,), (1,))
+
+        # UMMA partial-out reduce: 12 cons warps × 2 heads × 128 = 12 KB
+        _PARTIAL_DIM = HEAD_DIM_CKV // self.out_stages  # 128
+        smem_partial_umma_out = self._smem(alloc, cutlass.Float32,
+            (self.num_cons_warps, HEADS_PER_SPLIT, _PARTIAL_DIM),
+            (HEADS_PER_SPLIT * _PARTIAL_DIM, _PARTIAL_DIM, 1))
+
+        smem_partial_sgemm = self._smem(alloc, cutlass.Float32,
+            (self.num_sgemm_warps, HEADS_PER_SPLIT, HEAD_DIM_CKV // self.out_stages),
+            (HEADS_PER_SPLIT * (HEAD_DIM_CKV // self.out_stages), HEAD_DIM_CKV // self.out_stages, 1))
+
+        # ── UMMA smem: 9-panel layout (panels 0-7=CKV/Q_nope, panel 8=KPE/Q_pe) ──
+        swizzle    = cute.make_swizzle(3, 4, 3)
+        _MK_PACK   = 4
+        _MK_PACKED = 64
+        _MK_TILES     = HEAD_DIM_CKV // _MK_PACKED   # 8
+        _MK_TILES_PE  = HEAD_DIM_KPE  // _MK_PACKED  # 1
+        _MK_TILES_FULL = _MK_TILES + _MK_TILES_PE    # 9
+        _MMA_M = DIM_SPLIT
+        _MMA_N = 8
+        _MMA_K = 16
+        _MMA_M_PACK, _MMA_N_PACK = 1, 1
+        a_outer = cute.make_layout(
+            ((_MMA_M, _MMA_K), _MMA_M_PACK, (_MK_PACK, _MK_TILES_FULL)),
+            stride=((_MK_PACKED, 1), 0, (_MMA_K, _MMA_M * _MK_PACKED)))
+        b_outer = cute.make_layout(
+            ((_MMA_N, _MMA_K), _MMA_N_PACK, (_MK_PACK, _MK_TILES_FULL)),
+            stride=((_MK_PACKED, 1), 0, (_MMA_K, _MMA_N * _MK_PACKED)))
+        sA = alloc.allocate_tensor(cutlass.BFloat16, a_outer, byte_alignment=16, swizzle=swizzle)
+        sB = alloc.allocate_tensor(cutlass.BFloat16, b_outer, byte_alignment=16, swizzle=swizzle)
+        sA_ckv_copy = cute.make_tensor(sA.iterator, _panel_copy_layout(_MMA_M, _MK_PACKED, _MK_TILES))
+        sB_ckv_copy = cute.make_tensor(sB.iterator, _panel_copy_layout(_MMA_N, _MK_PACKED, _MK_TILES))
+        panel_stride_A = _MMA_M * _MK_PACKED * _MK_TILES
+        panel_stride_B = _MMA_N * _MK_PACKED * _MK_TILES
+        sA_kpe_copy = cute.make_tensor(sA.iterator + panel_stride_A, _panel_copy_layout(_MMA_M, _MK_PACKED, _MK_TILES_PE))
+        sB_kpe_copy = cute.make_tensor(sB.iterator + panel_stride_B, _panel_copy_layout(_MMA_N, _MK_PACKED, _MK_TILES_PE))
+        k_split_shape    = cute.make_layout(((_MK_PACKED, _MK_TILES),))
+        k_split_shape_pe = cute.make_layout(((_MK_PACKED, _MK_TILES_PE),))
+
+        atom_cpa   = cute.make_copy_atom(cpasync.CopyG2SOp(), cutlass.BFloat16, num_bits_per_copy=128)
+        thr_layout = cute.make_layout(((8, 4),), stride=((1, 8),))
+        val_layout = cute.make_layout(((8, 1),), stride=((1, 0),))
+        tiled_copy = cute.make_tiled_copy_tv(atom_cpa, thr_layout, val_layout)
+        lane_copy  = tiled_copy.get_slice(lane_idx)
+        atom_cpa_pe   = cute.make_copy_atom(cpasync.CopyG2SOp(), cutlass.BFloat16, num_bits_per_copy=32)
+        val_layout_pe = cute.make_layout(((2, 1),), stride=((1, 0),))
+        tiled_copy_pe = cute.make_tiled_copy_tv(atom_cpa_pe, thr_layout, val_layout_pe)
+        lane_copy_pe  = tiled_copy_pe.get_slice(lane_idx)
+
+        storage  = alloc.allocate(self.shared_storage)
+        mma_full_mbars = storage.mma_full_mbars.data_ptr()
+
+        # ========= Prologue =========
+        head_base_idx, split_idx_old, _ = cute.arch.block_idx()
+        T, _, _ = q_nope.shape
+
+        sparse_indices_  = cute.zipped_divide(sparse_indices, (1, self.sp_vec_size_i32))
+        smem_sp_indices_ = cute.zipped_divide(smem_sp_indices, (1, self.sp_vec_size_i32))
+        if self.num_umma_warps <= warp_idx < self.num_umma_warps + T:
+            warp_idx_sgemm = warp_idx - self.num_umma_warps
+            split_idx_new = (split_idx_old + warp_idx_sgemm * self.swz_rot_shift) % cutlass.Int32(NUM_SPLITS)
+            split_vec_stride = DIM_SPLIT // self.sp_vec_size_i32
+            si_vec = sparse_indices_[(0, None), (warp_idx_sgemm, split_idx_new * split_vec_stride + lane_idx)].load()
+            num_valid_partial = 0
+            for v in range(self.sp_vec_size_i32):
+                val = si_vec[v]
+                if 0 <= val < FLAT_CACHE:
+                    num_valid_partial += 1
+                else:
+                    val = 0
+                smem_sp_indices_[(0, v), (warp_idx_sgemm, lane_idx)] = val
+            num_valid = warp_reduce(num_valid_partial, lambda a, b: a + b, width=self.wsize)
+            if lane_idx == 0:
+                smem_assign[warp_idx_sgemm, 0] = split_idx_new
+                smem_assign[warp_idx_sgemm, 1] = num_valid
+
+        cute.arch.sync_threads()
+
+        # ── tmem / mbarrier setup ──
+        tCrA = tiled_mma.make_fragment_A(sA)
+        tCrB = tiled_mma.make_fragment_B(sB)
+        acc_shape       = tiled_mma.partition_shape_C((_MMA_M, _MMA_N))
+        tCtAcc_tmpl     = tiled_mma.make_fragment_C(acc_shape)
+        num_tmem_cols   = utils.get_num_tmem_alloc_cols(tCtAcc_tmpl)
+        tmem_alloc_cols = cutlass.Int32(num_tmem_cols * LIMIT_REQUEST)
+        if warp_idx == 0:
+            cute.arch.alloc_tmem(tmem_alloc_cols, storage.tmem_holding_buf)
+            if tidx == 0:
+                for i in range(LIMIT_REQUEST):
+                    cute.arch.mbarrier_init(mma_full_mbars + i, cnt=1)
+                cute.arch.mbarrier_init_fence()
+        cute.arch.sync_threads()
+        tmem_ptr = cute.arch.retrieve_tmem_ptr(
+            cutlass.Float32, alignment=16,
+            ptr_to_buffer_holding_addr=storage.tmem_holding_buf)
+        tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc_tmpl.layout)
+        M_acc           = cute.size(tCtAcc, mode=[0, 0])
+        ld_op           = tcgen05.Ld32x32bOp(tcgen05.Repetition(self.tmem_ld_rep))
+        epi_tiler       = ((M_acc, self.tmem_ld_rep),)
+        tCtAcc_epi      = cute.zipped_divide(tCtAcc, epi_tiler)
+        copy_atom_t2r   = cute.make_copy_atom(ld_op, cutlass.Float32)
+        tmem_tiled_copy = tcgen05.make_tmem_copy(copy_atom_t2r, tCtAcc_epi[None, 0])
+        tmem_thr_copy   = tmem_tiled_copy.get_slice(tidx)
+        tTR_tAcc        = tmem_thr_copy.partition_S(tCtAcc_epi)
+        tTR_rAcc        = cute.make_rmem_tensor(tTR_tAcc[None, None, 0].shape, cutlass.Float32)
+
+        # Hoisted views
+        smem_score_              = cute.zipped_divide(smem_score,              (1, DIM_SPLIT // self.wsize))
+        smem_score_sgemm_        = cute.zipped_divide(smem_score_sgemm,        (1, DIM_SPLIT // self.wsize))
+        smem_logits_flat_        = cute.zipped_divide(smem_logits_flat,        (HEADS_PER_SPLIT,))
+        smem_logits_flat_sgemm_  = cute.zipped_divide(smem_logits_flat_sgemm,  (HEADS_PER_SPLIT,))
+        smem_partial_umma_out_ = cute.zipped_divide(smem_partial_umma_out, (1, 1, self.out_vec))
+        smem_partial_sgemm_ = cute.zipped_divide(smem_partial_sgemm, (1, 1, self.out_vec))
+        ckv_flat_out        = cute.zipped_divide(ckv_flat,           (1, self.out_vec))
+        q_nope_z   = cute.zipped_divide(q_nope,   (1, 1, self.sgemm_ckv_vec))
+        q_pe_z     = cute.zipped_divide(q_pe,     (1, 1, self.sgemm_kpe_vec))
+        ckv_flat_z = cute.zipped_divide(ckv_flat, (1, self.sgemm_ckv_vec))
+        kpe_flat_z = cute.zipped_divide(kpe_flat, (1, self.sgemm_kpe_vec))
+
+        # ============================================================
+        # UMMA workers (full splits): warp-specialized
+        #   consumer = warps 0..11 (384t) — score, softmax, output (gmem K)
+        #   producer = warps 12..15 (128t) — Q+K cp.async LOAD + tcgen05 MMA issue
+        # ============================================================
+        if warp_idx < self.num_umma_warps:
+            is_consumer = warp_idx < self.num_cons_warps               # warps 0..11
+            is_producer = warp_idx >= self.num_cons_warps              # warps 12..15
+            cons_warp_idx = warp_idx
+            prod_warp_idx = warp_idx - self.num_cons_warps             # 0..3
+
+            # Register reallocation: producer shrinks; cons/sgemm benefit automatically.
+            if is_producer:
+                cute.arch.setmaxregister_decrease(self.num_regs_producer)
+
+            full_iter_count  = cutlass.Int32(0)
+            prev_full_slot   = cutlass.Int32(0)
+
+            num_rounds_prod = DIM_SPLIT // self.num_prod_warps            # 32
+            num_rounds_out  = (DIM_SPLIT + self.num_cons_warps - 1) // self.num_cons_warps  # 11
+
+            for T_idx in cutlass.range_constexpr(LIMIT_REQUEST):
+                if T_idx < T:
+                    split_idx_new = smem_assign[T_idx, 0]
+                    num_valid     = smem_assign[T_idx, 1]
+
+                    if num_valid == DIM_SPLIT:
+                        # =====================================================
+                        # PRODUCER: load Q+K, issue tcgen05 MMA, signal full
+                        # =====================================================
+                        if is_producer:
+                            if full_iter_count >= cutlass.Int32(1):
+                                cute.arch.mbarrier_wait(mma_full_mbars + prev_full_slot, cutlass.Int32(0))
+
+                            # Per-iter Q load (1 warp per head; uses prod warps 0..1)
+                            if prod_warp_idx < HEADS_PER_SPLIT:
+                                head_h = head_base_idx * HEADS_PER_SPLIT + prod_warp_idx
+                                cute.copy(atom_cpa,
+                                          lane_copy.partition_S(cute.composition(q_nope[T_idx, head_h, None], k_split_shape)),
+                                          lane_copy.partition_D(sB_ckv_copy[prod_warp_idx, None]))
+                                cute.copy(atom_cpa_pe,
+                                          lane_copy_pe.partition_S(cute.composition(q_pe[T_idx, head_h, None], k_split_shape_pe)),
+                                          lane_copy_pe.partition_D(sB_kpe_copy[prod_warp_idx, None]))
+
+                            # K load: 4 warps round-robin DIM_SPLIT cols (32 rounds each)
+                            for round_idx in range(num_rounds_prod):
+                                sp_idx  = round_idx * self.num_prod_warps + prod_warp_idx
+                                row_idx = smem_sp_indices[T_idx, sp_idx]
+                                cute.copy(atom_cpa,
+                                        lane_copy.partition_S(cute.composition(ckv_flat[row_idx, None], k_split_shape)),
+                                        lane_copy.partition_D(sA_ckv_copy[sp_idx, None]))
+                                cute.copy(atom_cpa_pe,
+                                        lane_copy_pe.partition_S(cute.composition(kpe_flat[row_idx, None], k_split_shape_pe)),
+                                        lane_copy_pe.partition_D(sA_kpe_copy[sp_idx, None]))
+
+                            cute.arch.cp_async_commit_group()
+                            cute.arch.cp_async_wait_group(0)
+                            cute.arch.fence_view_async_shared()
+                            cute.arch.barrier(barrier_id=self.prod_bar_id,
+                                              number_of_threads=self.prod_threads)
+
+                            tcgen05_fence()
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                            if prod_warp_idx == 0:
+                                tmem_slot_offset = cutlass.Int32(T_idx * self.tmem_cols_per_token)
+                                tCtAcc_i = cute.make_tensor(tmem_ptr + tmem_slot_offset, tCtAcc_tmpl.layout)
+                                num_k_blocks = cute.size(tCrA, mode=[2])
+                                for k_block_idx in range(num_k_blocks):
+                                    k_block_coord = (None, None, k_block_idx)
+                                    cute.gemm(tiled_mma, tCtAcc_i,
+                                            tCrA[k_block_coord], tCrB[k_block_coord], tCtAcc_i)
+                                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                                if lane_idx == 0:
+                                    tcgen05.commit(mma_full_mbars + T_idx)
+                            prev_full_slot = cutlass.Int32(T_idx)
+
+                        # =====================================================
+                        # CONSUMER: wait full, score, softmax, output (gmem K)
+                        # =====================================================
+                        if is_consumer:
+                            cute.arch.mbarrier_wait(mma_full_mbars + T_idx, cutlass.Int32(0))
+
+                            tmem_slot_offset = cutlass.Int32(T_idx * self.tmem_cols_per_token)
+                            tTR_tAcc_i = cute.make_tensor(
+                                tTR_tAcc.iterator + tmem_slot_offset,
+                                tTR_tAcc.layout,
+                            )
+
+                            # Score: tmem→reg→smem (only first 128 of 384 cons threads can ld tmem)
+                            if tidx < DIM_SPLIT:
+                                cute.copy(tmem_tiled_copy, tTR_tAcc_i[None, None, 0], tTR_rAcc)
+                                smem_score[0, tidx] = tTR_rAcc[0] * cutlass.Float32(sm_scale)
+                                smem_score[1, tidx] = tTR_rAcc[1] * cutlass.Float32(sm_scale)
+
+                            cute.arch.barrier(barrier_id=self.cons_bar_id,
+                                              number_of_threads=self.cons_threads)
+
+                            # Softmax: 2 warps (1 head each)
+                            if cons_warp_idx < HEADS_PER_SPLIT:
+                                num_elems: cutlass.Constexpr = DIM_SPLIT // self.wsize
+                                head_idx_global = head_base_idx * HEADS_PER_SPLIT + cons_warp_idx
+                                vec = smem_score_[(0, None), (cons_warp_idx, lane_idx)].load()
+                                vec_masked = cute.make_rmem_tensor(
+                                    cute.make_layout((num_elems,), stride=(1,)), cutlass.Float32)
+                                for v_idx in range(num_elems):
+                                    vec_masked[v_idx] = -cutlass.Float32(math.inf)
+                                for v_idx in range(num_elems):
+                                    col_idx = lane_idx * num_elems + v_idx
+                                    if col_idx < num_valid:
+                                        vec_masked[v_idx] = vec[v_idx]
+                                row_max = -cutlass.Float32(math.inf)
+                                for v_idx in range(num_elems):
+                                    row_max = cute.arch.fmax(row_max, vec_masked[v_idx])
+                                row_max = warp_reduce(row_max, cute.arch.fmax)
+                                row_sum = cutlass.Float32(0)
+                                for v_idx in range(num_elems):
+                                    e = cute.math.exp(vec_masked[v_idx] - row_max)
+                                    vec_masked[v_idx] = e
+                                    row_sum += e
+                                row_sum = warp_reduce(row_sum, lambda a, b: a + b)
+                                for v_idx in range(num_elems):
+                                    col_idx = lane_idx * num_elems + v_idx
+                                    smem_logits_flat[col_idx * HEADS_PER_SPLIT + cons_warp_idx] = vec_masked[v_idx]
+                                if lane_idx == 0:
+                                    partial_lse[T_idx, split_idx_new, head_idx_global, 0] = row_max
+                                    partial_lse[T_idx, split_idx_new, head_idx_global, 1] = row_sum
+
+                            cute.arch.barrier(barrier_id=self.cons_bar_id,
+                                              number_of_threads=self.cons_threads)
+
+                            # Output GEMV: 12 cons warps round-robin K-rows; K from gmem (L2).
+                            out0 = cute.make_rmem_tensor((self.out_vec,), cutlass.Float32)
+                            out1 = cute.make_rmem_tensor((self.out_vec,), cutlass.Float32)
+                            for stage_idx in range(self.out_stages):
+                                out0.fill(cutlass.Float32(0))
+                                out1.fill(cutlass.Float32(0))
+                                for round_idx in range(num_rounds_out):
+                                    k = round_idx * self.num_cons_warps + cons_warp_idx
+                                    if k < num_valid:
+                                        flat_cache_idx = smem_sp_indices[T_idx, k]
+                                        gmem_ckv_vec = ckv_flat_out[(0, None), (flat_cache_idx, stage_idx * self.wsize + lane_idx)].load().to(cutlass.Float32)
+                                        smem_logits_vec = smem_logits_flat_[(None), (k)].load()
+                                        for v_idx in range(self.out_vec):
+                                            out0[v_idx], out1[v_idx] = cute.arch.fma_packed_f32x2(
+                                                (smem_logits_vec[0], smem_logits_vec[1]),
+                                                (gmem_ckv_vec[v_idx], gmem_ckv_vec[v_idx]),
+                                                (out0[v_idx], out1[v_idx]))
+
+                                smem_partial_umma_out_[(0, 0, None), (cons_warp_idx, 0, lane_idx)].store(out0.load())
+                                smem_partial_umma_out_[(0, 0, None), (cons_warp_idx, 1, lane_idx)].store(out1.load())
+
+                                cute.arch.barrier(barrier_id=self.cons_bar_id,
+                                                  number_of_threads=self.cons_threads)
+
+                                # Reduce 12 partials → STG. 384 cons threads = 3 thread groups
+                                # of 128; only first 2 (HEADS_PER_SPLIT) are active for the STG.
+                                thr_group_idx  = tidx // DIM_SPLIT
+                                thr_group_lane = tidx %  DIM_SPLIT
+                                if thr_group_idx < HEADS_PER_SPLIT:
+                                    head_idx_global = head_base_idx * HEADS_PER_SPLIT + thr_group_idx
+                                    out_col = stage_idx * DIM_SPLIT + thr_group_lane
+                                    final_sum = cutlass.Float32(0)
+                                    for i in range(self.num_cons_warps):
+                                        final_sum += smem_partial_umma_out[i, thr_group_idx, thr_group_lane]
+                                    partial_out[T_idx, split_idx_new, head_idx_global, out_col] = final_sum
+
+                                cute.arch.barrier(barrier_id=self.cons_bar_id,
+                                                  number_of_threads=self.cons_threads)
+
+                        full_iter_count = full_iter_count + cutlass.Int32(1)
+
+        # ============================================================
+        # SGEMM workers: partial splits (unchanged from v5)
+        # ============================================================
+        else:
+            sgemm_warp_idx = warp_idx - self.num_umma_warps
+            sgemm_tidx     = tidx - self.umma_threads
+
+            for T_idx in cutlass.range_constexpr(LIMIT_REQUEST):
+                if T_idx < T:
+                    split_idx_new = smem_assign[T_idx, 0]
+                    num_valid     = smem_assign[T_idx, 1]
+
+                    if 0 < num_valid < DIM_SPLIT:
+                        head_idx0 = head_base_idx * HEADS_PER_SPLIT
+                        head_idx1 = head_base_idx * HEADS_PER_SPLIT + 1
+
+                        num_rounds_score = (num_valid + self.num_sgemm_warps - 1) // self.num_sgemm_warps
+                        for round_idx in range(num_rounds_score):
+                            col_idx = round_idx * self.num_sgemm_warps + sgemm_warp_idx
+                            if col_idx < num_valid:
+                                flat_cache_idx = smem_sp_indices[T_idx, col_idx]
+                                acc0 = cutlass.Float32(0)
+                                acc1 = cutlass.Float32(0)
+
+                                for i in range(HEAD_DIM_CKV // (self.sgemm_ckv_vec * self.wsize)):
+                                    row_idx = i * self.wsize + lane_idx
+                                    qn0_frag = q_nope_z[(0, 0, None), (T_idx, head_idx0, row_idx)].load().to(cutlass.Float32)
+                                    qn1_frag = q_nope_z[(0, 0, None), (T_idx, head_idx1, row_idx)].load().to(cutlass.Float32)
+                                    ckv_frag = ckv_flat_z[(0, None), (flat_cache_idx, row_idx)].load().to(cutlass.Float32)
+                                    for v in range(self.sgemm_ckv_vec):
+                                        acc0, acc1 = cute.arch.fma_packed_f32x2(
+                                            (qn0_frag[v], qn1_frag[v]),
+                                            (ckv_frag[v], ckv_frag[v]),
+                                            (acc0, acc1))
+
+                                for i in range(HEAD_DIM_KPE // (self.sgemm_kpe_vec * self.wsize)):
+                                    row_idx = i * self.wsize + lane_idx
+                                    qp0_frag = q_pe_z[(0, 0, None), (T_idx, head_idx0, row_idx)].load().to(cutlass.Float32)
+                                    qp1_frag = q_pe_z[(0, 0, None), (T_idx, head_idx1, row_idx)].load().to(cutlass.Float32)
+                                    kpe_frag = kpe_flat_z[(0, None), (flat_cache_idx, row_idx)].load().to(cutlass.Float32)
+                                    for v in range(self.sgemm_kpe_vec):
+                                        acc0, acc1 = cute.arch.fma_packed_f32x2(
+                                            (qp0_frag[v], qp1_frag[v]),
+                                            (kpe_frag[v], kpe_frag[v]),
+                                            (acc0, acc1))
+
+                                acc0 = warp_reduce(acc0, lambda a, b: a + b)
+                                acc1 = warp_reduce(acc1, lambda a, b: a + b)
+                                if lane_idx == 0:
+                                    smem_score_sgemm[0, col_idx] = acc0 * cutlass.Float32(sm_scale)
+                                    smem_score_sgemm[1, col_idx] = acc1 * cutlass.Float32(sm_scale)
+
+                        cute.arch.barrier(barrier_id=self.sgemm_bar_id,
+                                          number_of_threads=self.sgemm_threads)
+
+                        if sgemm_warp_idx < HEADS_PER_SPLIT:
+                            num_elems: cutlass.Constexpr = DIM_SPLIT // self.wsize
+                            head_idx_global = head_base_idx * HEADS_PER_SPLIT + sgemm_warp_idx
+                            vec = smem_score_sgemm_[(0, None), (sgemm_warp_idx, lane_idx)].load()
+                            vec_masked = cute.make_rmem_tensor(
+                                cute.make_layout((num_elems,), stride=(1,)), cutlass.Float32)
+                            for v_idx in range(num_elems):
+                                vec_masked[v_idx] = -cutlass.Float32(math.inf)
+                            for v_idx in range(num_elems):
+                                col_idx = lane_idx * num_elems + v_idx
+                                if col_idx < num_valid:
+                                    vec_masked[v_idx] = vec[v_idx]
+                            row_max = -cutlass.Float32(math.inf)
+                            for v_idx in range(num_elems):
+                                row_max = cute.arch.fmax(row_max, vec_masked[v_idx])
+                            row_max = warp_reduce(row_max, cute.arch.fmax)
+                            row_sum = cutlass.Float32(0)
+                            for v_idx in range(num_elems):
+                                e = cute.math.exp(vec_masked[v_idx] - row_max)
+                                vec_masked[v_idx] = e
+                                row_sum += e
+                            row_sum = warp_reduce(row_sum, lambda a, b: a + b)
+                            for v_idx in range(num_elems):
+                                col_idx = lane_idx * num_elems + v_idx
+                                smem_logits_flat_sgemm[col_idx * HEADS_PER_SPLIT + sgemm_warp_idx] = vec_masked[v_idx]
+                            if lane_idx == 0:
+                                partial_lse[T_idx, split_idx_new, head_idx_global, 0] = row_max
+                                partial_lse[T_idx, split_idx_new, head_idx_global, 1] = row_sum
+
+                        cute.arch.barrier(barrier_id=self.sgemm_bar_id,
+                                          number_of_threads=self.sgemm_threads)
+
+                        num_rounds_out_s = (num_valid + self.num_sgemm_warps - 1) // self.num_sgemm_warps
+                        out0_s = cute.make_rmem_tensor((self.out_vec,), cutlass.Float32)
+                        out1_s = cute.make_rmem_tensor((self.out_vec,), cutlass.Float32)
+
+                        for stage_idx in range(self.out_stages):
+                            out0_s.fill(cutlass.Float32(0))
+                            out1_s.fill(cutlass.Float32(0))
+                            for round_idx in range(num_rounds_out_s):
+                                k = round_idx * self.num_sgemm_warps + sgemm_warp_idx
+                                if k < num_valid:
+                                    flat_cache_idx = smem_sp_indices[T_idx, k]
+                                    gmem_ckv_vec = ckv_flat_out[(0, None), (flat_cache_idx, stage_idx * self.wsize + lane_idx)].load().to(cutlass.Float32)
+                                    smem_logits_vec = smem_logits_flat_sgemm_[(None), (k)].load()
+                                    for v_idx in range(self.out_vec):
+                                        out0_s[v_idx], out1_s[v_idx] = cute.arch.fma_packed_f32x2(
+                                            (smem_logits_vec[0], smem_logits_vec[1]),
+                                            (gmem_ckv_vec[v_idx], gmem_ckv_vec[v_idx]),
+                                            (out0_s[v_idx], out1_s[v_idx]))
+
+                            smem_partial_sgemm_[(0, 0, None), (sgemm_warp_idx, 0, lane_idx)].store(out0_s.load())
+                            smem_partial_sgemm_[(0, 0, None), (sgemm_warp_idx, 1, lane_idx)].store(out1_s.load())
+
+                            cute.arch.barrier(barrier_id=self.sgemm_bar_id,
+                                              number_of_threads=self.sgemm_threads)
+
+                            thr_group_idx  = sgemm_tidx // DIM_SPLIT
+                            thr_group_lane = sgemm_tidx %  DIM_SPLIT
+                            if thr_group_idx < HEADS_PER_SPLIT:
+                                head_idx_global = head_base_idx * HEADS_PER_SPLIT + thr_group_idx
+                                out_col = stage_idx * DIM_SPLIT + thr_group_lane
+                                final_sum = cutlass.Float32(0)
+                                for i in range(self.num_sgemm_warps):
+                                    final_sum += smem_partial_sgemm[i, thr_group_idx, thr_group_lane]
+                                partial_out[T_idx, split_idx_new, head_idx_global, out_col] = final_sum
+
+                            cute.arch.barrier(barrier_id=self.sgemm_bar_id,
+                                              number_of_threads=self.sgemm_threads)
+
+        # Epilogue
+        cute.arch.sync_threads()
+        if warp_idx == 0:
+            cute.arch.relinquish_tmem_alloc_permit()
+        cute.arch.sync_threads()
+        if warp_idx == 0:
+            cute.arch.dealloc_tmem(tmem_ptr, tmem_alloc_cols)
+
+    @cute.kernel
+    def reduce_kernel(
+        self,
+        sparse_indices: cute.Tensor,
+        partial_out:    cute.Tensor,
+        partial_lse:    cute.Tensor,
+        output:         cute.Tensor,
+        lse:            cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane_idx = cute.arch.lane_idx()
+        T_idx, head_idx, _ = cute.arch.block_idx()
+
+        alloc = cutlass.utils.SmemAllocator()
+        smem_red_i32 = self._smem(alloc, cutlass.Int32,   (32,),          (1,))
+        smem_max_sum = self._smem(alloc, cutlass.Float32, (NUM_SPLITS, 2), (2, 1))
+
+        partial_cnt = cutlass.Int32(0)
+        for i in range(tidx, TOP_K, self.reduce_threads):
+            idx = sparse_indices[T_idx, i]
+            if idx >= cutlass.Int32(0):
+                partial_cnt += cutlass.Int32(1)
+
+        cnt_sum = warp_reduce(partial_cnt, lambda a, b: a + b)
+        if lane_idx == 0:
+            smem_red_i32[warp_idx] = cnt_sum
+        cute.arch.sync_threads()
+
+        if warp_idx == 0:
+            val = cutlass.Int32(0)
+            if lane_idx < self.reduce_warps:
+                val = smem_red_i32[lane_idx]
+            val = warp_reduce(val, lambda a, b: a + b, width=self.reduce_warps)
+            if lane_idx == 0:
+                smem_red_i32[0] = val
+        cute.arch.sync_threads()
+
+        num_valid = smem_red_i32[0]
+        num_active_splits = (num_valid + DIM_SPLIT - 1) // DIM_SPLIT
+
+        if tidx < num_active_splits:
+            smem_max_sum[tidx, 0] = partial_lse[T_idx, tidx, head_idx, 0]
+            smem_max_sum[tidx, 1] = partial_lse[T_idx, tidx, head_idx, 1]
+        cute.arch.sync_threads()
+
+        partial_out_v = cute.zipped_divide(partial_out, (1, 1, 1, self.vec_reduce))
+        output_v      = cute.zipped_divide(output,      (1, 1, self.vec_reduce))
+
+        g_max = -cutlass.Float32(math.inf)
+        for s in range(num_active_splits):
+            local_max = smem_max_sum[s, 0]
+            if local_max > g_max:
+                g_max = local_max
+
+        g_lse_sum = cutlass.Float32(0)
+        acc_rmem = cute.make_rmem_tensor(cute.make_layout((self.vec_reduce,), stride=(1,)), cutlass.Float32)
+        acc_rmem[0] = cutlass.Float32(0)
+        acc_rmem[1] = cutlass.Float32(0)
+        acc = acc_rmem.load()
+
+        for s in range(num_active_splits):
+            l_max = smem_max_sum[s, 0]
+            l_sum = smem_max_sum[s, 1]
+            scale = cute.math.exp(l_max - g_max)
+            g_lse_sum += l_sum * scale
+            a = partial_out_v[(0, 0, 0, None), (T_idx, s, head_idx, tidx)].load()
+            acc = acc + scale * a
+
+        if tidx == 0:
+            lse[T_idx, head_idx] = (g_max + cute.math.log(g_lse_sum)) / cutlass.Float32(LN2)
+
+        output_v[(0, 0, None), (T_idx, head_idx, tidx)].store((acc / g_lse_sum).to(cutlass.BFloat16))
+
+
+def _fake(dtype, shape, stride_order, align):
+    return make_fake_compact_tensor(dtype=dtype, shape=shape, stride_order=stride_order, assumed_align=align)
+
+
+def compile_hybrid():
+    T = cute.sym_int()
+    q_nope         = _fake(cute.BFloat16, (T, NUM_HEADS, HEAD_DIM_CKV), (2, 1, 0), 16)
+    q_pe           = _fake(cute.BFloat16, (T, NUM_HEADS, HEAD_DIM_KPE), (2, 1, 0), 16)
+    ckv_cache      = _fake(cute.BFloat16, (NUM_PAGES, PAGE_SIZE, HEAD_DIM_CKV), (2, 1, 0), 16)
+    kpe_cache      = _fake(cute.BFloat16, (NUM_PAGES, PAGE_SIZE, HEAD_DIM_KPE), (2, 1, 0), 16)
+    sparse_indices = _fake(cute.Int32,    (T, TOP_K), (1, 0), 4)
+    sm_scale       = SM_SCALE
+    partial_out    = _fake(cute.Float32,  (LIMIT_REQUEST, NUM_SPLITS, NUM_HEADS, HEAD_DIM_CKV), (3, 2, 1, 0), 16)
+    partial_lse    = _fake(cute.Float32,  (LIMIT_REQUEST, NUM_SPLITS, NUM_HEADS, 2),            (3, 2, 1, 0), 16)
+    output         = _fake(cute.BFloat16, (T, NUM_HEADS, HEAD_DIM_CKV), (2, 1, 0), 16)
+    lse            = _fake(cute.Float32,  (T, NUM_HEADS), (1, 0), 4)
+    stream         = make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    hybrid = Dsa()
+    compiled = cute.compile(
+        hybrid,
+        q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale,
+        partial_out, partial_lse, output, lse, stream,
+        options="--enable-tvm-ffi"
+    )
+    return hybrid, compiled
+
+
+_hybrid, _compiled = compile_hybrid()
+
+
+def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, lse):
+    _compiled(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices,
+              _hybrid.partial_out, _hybrid.partial_lse, output, lse)

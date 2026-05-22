@@ -33,6 +33,10 @@ CONTEST = Path(_os.environ.get(
 ))
 JSONL   = CONTEST / "workloads" / "dsa_paged" / "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64.jsonl"
 
+# ── Workload range (override on Modal). 0-indexed; END=0 means run to end. ──
+START = 0
+END   = 0
+
 # ── Per-workload metadata (1-indexed, 23 workloads) ──
 # Each entry: (uuid, T, max_valid_list)
 WORKLOAD_INFO = [
@@ -158,8 +162,10 @@ def main():
             pretty_diff("lse", r_lse, i_lse)
         return
 
-    workloads = [json.loads(l) for l in open(JSONL)]
-    print(f"=== {len(workloads)} REAL WORKLOADS ===")
+    all_workloads = [json.loads(l) for l in open(JSONL)]
+    end = END if END > 0 else len(all_workloads)
+    workloads = all_workloads[START:end]
+    print(f"=== {len(workloads)} REAL WORKLOADS (#{START+1}..#{end} of {len(all_workloads)}) ===")
 
     hdr = f"{'#':>3} {'UUID':>10} {'T':>2}"
     if CHECK:   hdr += f" {'abs_err':>10} {'Status':>6}"
@@ -170,7 +176,7 @@ def main():
 
     all_pass = True
     durations, ref_ms_list, gflops_list, speedups, max_valids = [], [], [], [], []
-    for i_w, w in enumerate(workloads):
+    for i_w, w in enumerate(workloads, start=START):
         ax  = w["workload"]["axes"]
         inp = w["workload"]["inputs"]
         T, P = ax["num_tokens"], ax["num_pages"]
